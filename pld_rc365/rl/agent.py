@@ -1,0 +1,260 @@
+"""Residual SAC specialist with Cal-QL critic warm-start (PLD §3.1, Alg. 1, Table 5).
+
+Alg. 1 order: (1) Cal-QL pre-train the critic on the offline buffer (successful base rollouts),
+(2) *randomly* (re-)initialise pi_delta, (3) online SAC with symmetric offline/online sampling,
+no BC term on the actor, TD target bootstraps the combined policy a_bar = a_b + a_delta (Eq. 2).
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import threading
+import time
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from .buffers import ReplayBuffer, symmetric_sample
+from .networks import Critic, Encoder, ResidualActor, combine
+
+
+class XiSchedule:
+    def __init__(self, cfg: dict):
+        self.kind = cfg.get("xi_schedule", "constant")
+        self.xi = float(cfg["xi"])
+        self.start = float(cfg.get("xi_start", self.xi))
+        self.ramp = int(cfg.get("xi_ramp_steps", 1))
+
+    def __call__(self, online_steps: int) -> float:
+        if self.kind == "constant":
+            return self.xi
+        frac = min(1.0, online_steps / max(1, self.ramp))
+        return self.start + frac * (self.xi - self.start)
+
+
+class ResidualSAC:
+    def __init__(self, rl: dict, residual: dict, fmap_shape: tuple, n_cams: int, proprio_dim: int = 16,
+                 base_dim: int = 12, device: str = "cuda:0", seed: int = 0):
+        self.rl, self.res = rl, residual
+        self.device = torch.device(device)
+        self.act_dim = int(residual["dims"])
+        self.gamma = float(rl["discount"])
+        self.tau = float(rl["tau"])
+        self.batch = int(rl["batch_size"])
+        self.target_entropy = -self.act_dim * float(rl["target_entropy_scale"])
+        self.xi_sched = XiSchedule(residual)
+        self.online_steps = 0  # stored online transitions (budget)
+        self.xi_steps = 0      # stored online transitions where the residual acted (drives the xi schedule;
+                               # warm-up / base-only steps do not advance it)
+        self._arch = dict(fmap_shape=fmap_shape, n_cams=n_cams, proprio_dim=proprio_dim, base_dim=base_dim)
+        torch.manual_seed(seed)
+        self.rng = np.random.default_rng(seed)
+
+        self.critic = Critic(self._make_encoder(), self.act_dim, rl["hidden_dim"], rl["num_q"]).to(self.device)
+        self.critic_targ = copy.deepcopy(self.critic).requires_grad_(False)
+        self.critic_opt = torch.optim.AdamW(self.critic.parameters(), lr=rl["lr"])
+        self.init_actor()
+        self.n_updates = 0
+
+    # ------------------------------------------------------------------ construction
+    def _make_encoder(self) -> Encoder:
+        a = self._arch
+        return Encoder(a["n_cams"], a["fmap_shape"], a["proprio_dim"], a["base_dim"],
+                       self.rl["latent_dim"], self.rl["num_spatial_features"])
+
+    def init_actor(self):
+        """Random (re-)initialisation of pi_delta and the temperature (Alg. 1: after critic pre-training)."""
+        self.actor = ResidualActor(self._make_encoder(), self.act_dim, self.rl["hidden_dim"]).to(self.device)
+        self.actor_opt = torch.optim.AdamW(self.actor.parameters(), lr=self.rl["lr"])
+        self.log_alpha = torch.tensor(math.log(self.rl["init_temperature"]), device=self.device, requires_grad=True)
+        self.alpha_opt = torch.optim.AdamW([self.log_alpha], lr=self.rl["lr"])
+
+    @property
+    def xi(self) -> float:
+        return self.xi_sched(self.xi_steps)
+
+    # ------------------------------------------------------------------ helpers
+    def _to_t(self, b: dict) -> dict[str, torch.Tensor]:
+        return {k: torch.as_tensor(v, device=self.device) for k, v in b.items()}
+
+    def _step(self, opt, loss, params):
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, self.rl["grad_clip"])
+        opt.step()
+
+    def _td_target(self, b, xi):
+        with torch.no_grad():
+            nf, npp, nab = b["next_feat"], b["next_proprio"], b["next_a_b"]
+            n = int(self.rl.get("otf_samples", 1))
+            if n <= 1:
+                a_d, logp = self.actor(nf, npp, nab, xi)
+                q_next = self.critic_targ(nf, npp, nab, combine(nab, a_d, self.act_dim)).min(0).values
+            else:  # on-the-fly: sample n residuals at the fixed base action, back up the max
+                B = nf.shape[0]
+                rep = lambda x: x.repeat_interleave(n, 0)  # noqa: E731
+                a_d, logp = self.actor(rep(nf), rep(npp), rep(nab), xi)
+                q = self.critic_targ(rep(nf), rep(npp), rep(nab), combine(rep(nab), a_d, self.act_dim)).min(0).values
+                q, arg = q.view(B, n).max(1)
+                logp = logp.view(B, n).gather(1, arg[:, None]).squeeze(1)
+                q_next = q
+            if self.rl.get("backup_entropy", False):
+                q_next = q_next - self.log_alpha.exp() * logp
+            r = b["reward"] + float(self.rl.get("reward_bias", 0.0))
+            return r + self.gamma * (1.0 - b["done"]) * q_next
+
+    def _soft_update(self):
+        with torch.no_grad():
+            for p, pt in zip(self.critic.parameters(), self.critic_targ.parameters()):
+                pt.mul_(1 - self.tau).add_(p, alpha=self.tau)
+
+    # ------------------------------------------------------------------ losses
+    def critic_loss(self, b, xi, calql_alpha: float = 0.0):
+        y = self._td_target(b, xi)
+        z = self.critic.encoder(b["feat"], b["proprio"], b["a_b"])
+        q = self.critic(None, None, None, b["a_bar"], z=z)  # (num_q, B)
+        loss = sum(F.mse_loss(qi, y) for qi in q)
+        info = {"q": q.mean().item(), "td_target": y.mean().item()}
+        if calql_alpha > 0:
+            cql, cinfo = self._calql_term(b, z, q, xi)
+            loss = loss + calql_alpha * cql
+            info.update(cinfo)
+        return loss, info
+
+    def _calql_term(self, b, z, q_data, xi):
+        """Cal-QL (Nakamoto et al. 2024): CQL(H) with policy-action Q-values lower-bounded by MC returns.
+        Random actions are drawn uniformly from the residual support a_b + U[-xi, xi]."""
+        n = int(self.rl["calql"]["num_samples"])
+        B = z.shape[0]
+        rep = lambda x: x.repeat_interleave(n, 0)  # noqa: E731
+        zr, ab = rep(z), rep(b["a_b"])
+        d = self.act_dim
+        # uniform residuals
+        u = (torch.rand(B * n, d, device=self.device) * 2 - 1) * xi
+        q_rand = self.critic(None, None, None, combine(ab, u, d), z=zr)
+        log_dens_rand = -d * math.log(2 * xi)
+        with torch.no_grad():
+            a_pi, logp_pi = self.actor(rep(b["feat"]), rep(b["proprio"]), ab, xi)
+            a_nx, logp_nx = self.actor(rep(b["next_feat"]), rep(b["next_proprio"]), rep(b["next_a_b"]), xi)
+        q_pi = self.critic(None, None, None, combine(ab, a_pi, d), z=zr)
+        q_nx = self.critic(None, None, None, combine(ab, a_nx, d), z=zr)
+        mc = rep(b["mc_return"])[None]
+        q_pi = torch.maximum(q_pi, mc)   # Cal-QL calibration
+        q_nx = torch.maximum(q_nx, mc)
+        cat = torch.cat([
+            (q_rand - log_dens_rand).view(-1, B, n),
+            (q_pi - logp_pi[None]).view(-1, B, n),
+            (q_nx - logp_nx[None]).view(-1, B, n),
+        ], dim=-1)
+        lse = torch.logsumexp(cat, dim=-1)  # (num_q, B)
+        cql = (lse - q_data).mean(-1).sum()
+        return cql, {"cql_gap": (lse - q_data).mean().item()}
+
+    def actor_loss(self, b, xi):
+        a_d, logp = self.actor(b["feat"], b["proprio"], b["a_b"], xi)
+        with torch.no_grad():
+            z = self.critic.encoder(b["feat"], b["proprio"], b["a_b"])
+        q = self.critic(None, None, None, combine(b["a_b"], a_d, self.act_dim), z=z).min(0).values
+        alpha = self.log_alpha.exp().detach()
+        loss = (alpha * logp - q).mean()
+        alpha_loss = -(self.log_alpha * (logp.detach() + self.target_entropy)).mean()
+        return loss, alpha_loss, {"entropy": -logp.mean().item(), "alpha": alpha.item()}
+
+    # ------------------------------------------------------------------ updates
+    def update(self, b_np: dict, calql_alpha: float = 0.0) -> dict:
+        b = self._to_t(b_np)
+        xi = self.xi
+        closs, info = self.critic_loss(b, xi, calql_alpha)
+        self._step(self.critic_opt, closs, self.critic.parameters())
+        self._soft_update()
+        self.n_updates += 1
+        info["critic_loss"] = closs.item()
+        if self.n_updates % int(self.rl["critic_actor_ratio"]) == 0:
+            # critic params receive no grads here (q computed with frozen z, and actor_opt only steps the actor)
+            aloss, alpha_loss, ainfo = self.actor_loss(b, xi)
+            self._step(self.actor_opt, aloss, self.actor.parameters())
+            self.alpha_opt.zero_grad(set_to_none=True)
+            alpha_loss.backward()
+            self.alpha_opt.step()
+            info.update(ainfo, actor_loss=aloss.item())
+        return info
+
+    def pretrain_calql(self, offline: ReplayBuffer, steps: int, log_fn=None):
+        alpha = float(self.rl["calql"]["alpha"])
+        for i in range(steps):
+            info = self.update(offline.sample(self.batch, self.rng), calql_alpha=alpha)
+            if log_fn and (i % 1000 == 0 or i == steps - 1):
+                log_fn(step=i, **info)
+        self.init_actor()  # Alg. 1: delta policy randomly initialised after critic warm-start
+        self.n_updates = 0
+
+    # ------------------------------------------------------------------ acting
+    @torch.no_grad()
+    def act(self, actor: ResidualActor, feats, proprio, a_base, deterministic: bool) -> np.ndarray:
+        f = torch.as_tensor(feats, device=self.device)
+        p = torch.as_tensor(proprio, device=self.device)
+        ab = torch.as_tensor(a_base, device=self.device)
+        a_d, _ = actor(f, p, ab, self.xi, deterministic=deterministic, with_logprob=False)
+        return a_d.cpu().numpy()
+
+    def state_dict(self) -> dict:
+        return {
+            "actor": self.actor.state_dict(), "critic": self.critic.state_dict(),
+            "critic_targ": self.critic_targ.state_dict(), "log_alpha": self.log_alpha.detach().cpu(),
+            "online_steps": self.online_steps, "xi_steps": self.xi_steps, "xi": self.xi,
+            "n_updates": self.n_updates, "arch": self._arch,
+        }
+
+    def load_state_dict(self, sd: dict):
+        self.actor.load_state_dict(sd["actor"])
+        self.critic.load_state_dict(sd["critic"])
+        self.critic_targ.load_state_dict(sd["critic_targ"])
+        with torch.no_grad():
+            self.log_alpha.copy_(sd["log_alpha"].to(self.device))
+        self.online_steps = sd.get("online_steps", 0)
+        self.xi_steps = sd.get("xi_steps", 0)  # stage 2 / eval continue with the xi the actor ended training at
+        self.n_updates = sd.get("n_updates", 0)
+
+
+class AsyncLearner(threading.Thread):
+    """SERL-style asynchronous learner for one specialist. Throttled to `utd` critic updates per stored
+    online transition; pushes actor weights to the collector copy every `actor_sync_every` updates."""
+
+    def __init__(self, agent: ResidualSAC, offline: ReplayBuffer, online: ReplayBuffer, collector_actor,
+                 actor_lock: threading.Lock, log_fn=None):
+        super().__init__(daemon=True)
+        self.agent, self.offline, self.online = agent, offline, online
+        self.collector_actor, self.actor_lock = collector_actor, actor_lock
+        self.log_fn = log_fn
+        self.stop_flag = threading.Event()
+        self.utd = float(agent.rl.get("utd", 1.0))
+        self.sync_every = int(agent.rl.get("actor_sync_every", 50))
+        self.error: BaseException | None = None
+
+    def push_actor(self):
+        with self.actor_lock:
+            self.collector_actor.load_state_dict(self.agent.actor.state_dict())
+
+    def run(self):
+        try:
+            last_log = time.time()
+            while not self.stop_flag.is_set():
+                budget = self.utd * self.online.total_added
+                if len(self.online) == 0 or self.agent.n_updates >= budget:
+                    time.sleep(0.005)
+                    continue
+                info = self.agent.update(symmetric_sample(self.offline, self.online, self.agent.batch, self.agent.rng))
+                if self.agent.n_updates % self.sync_every == 0:
+                    self.push_actor()
+                if self.log_fn and time.time() - last_log > 30:
+                    self.log_fn(n_updates=self.agent.n_updates, **info)
+                    last_log = time.time()
+        except BaseException as e:  # noqa: BLE001
+            self.error = e
+            raise
+
+    def stop(self):
+        self.stop_flag.set()
+        self.join(timeout=60)

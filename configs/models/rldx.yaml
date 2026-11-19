@@ -1,0 +1,8 @@
+base:
+  kind: rldx
+  model_path: RLWRLD/RLDX-1-FT-RC365
+  host: 127.0.0.1
+  port: 21000
+  exec_steps: 8            # RLDX RC365 eval: n_action_steps=8 of the 16-step chunk
+  chunk_len: 16
+  history_indices: [-6, -4, -2, 0]

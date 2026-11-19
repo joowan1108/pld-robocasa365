@@ -1,0 +1,79 @@
+# Shared defaults. Paper references: arXiv 2511.00091 (PLD), Table 5 / Alg. 1 / §3 / §4.5.
+paths:
+  runs_root: runs            # relative to repo root unless absolute
+  data_root: runs/pld_data   # LeRobot datasets written by stage 2
+
+env:
+  camera_size: 256           # what both VLAs consume (RC365 gym-wrapper convention)
+  obj_instance_split: pretrain
+  horizon: null              # null -> robocasa get_task_horizon(task)  (T in the paper)
+  num_envs: 4                # parallel env worker processes. Each RoboCasa env takes ~6.5 GB host RAM and some
+                             # GPU memory for EGL rendering; 4 fits a 24 GB 4090 next to XR1 + the learner.
+  mujoco_gl: egl
+
+probing:
+  alpha: 0.8                 # T_base ~ U[0, alpha*T]   (user choice; paper plateau at 0.6)
+  # T = task horizon (paper-literal, user choice)
+
+residual:
+  dims: 7                    # eef dpos(3) + drot(3) + gripper(1); base/torso/mode pass through
+  xi: 0.5                    # final residual magnitude bound (Table 5, B.2: 0.5 for LIBERO)
+  xi_schedule: linear        # constant | linear. Paper §3.1: "tuned by a scheduler" -- start small so early
+                             # exploration stays near pi_b (B.2: large xi at the start hurts), grow to xi.
+  xi_start: 0.1              # (B.2 suggests 0.1 for SimplerEnv; used here as the conservative start)
+  xi_ramp_steps: 50000       # residual-acted online steps to reach xi (form/length not given in the paper)
+  image_size: 128
+  cameras: [robot0_agentview_left, robot0_eye_in_hand]
+
+rl:                          # Table 5
+  batch_size: 256
+  buffer_capacity: 250000
+  discount: 0.99
+  lr: 3.0e-4
+  grad_clip: 1.0
+  reward_bias: 0.0
+  warmup_episodes: 100
+  critic_actor_ratio: 2
+  otf_samples: 1             # on-the-fly ratio (1 = plain SAC backup)
+  target_entropy_scale: 0.5  # target entropy = -act_dim * 0.5
+  init_temperature: 1.0
+  tau: 0.005
+  num_q: 2
+  hidden_dim: 256
+  latent_dim: 256
+  num_spatial_features: 8    # SERL SpatialLearnedEmbeddings
+  backup_entropy: false      # SERL default
+  utd: 1.0                   # critic updates per stored online transition (async learner throttle)
+  actor_sync_every: 50       # learner steps between actor weight pushes to the collector
+  offline_successes: 50      # n in Alg. 1
+  calql:
+    steps: 20000
+    alpha: 5.0
+    num_samples: 10
+  device: cuda:0
+
+stage1:
+  max_online_env_steps: 250000   # stored online transitions (paper: 250k online steps)
+  max_wall_hours: 48
+  sr_window: 100                 # Fig. 5 sliding window
+  sr_thresholds: [0.8, 0.9, 0.95]
+  stop_sr: 0.95
+  checkpoint_every_episodes: 200
+  final_eval_episodes: 50
+
+stage2:
+  target_successes: 200
+  marks: [50, 100, 200]
+  residual_deterministic: true   # use mean of pi_delta for expert data
+  keep_pure_base: true           # base succeeded before takeover -> still a tau_demo (flagged)
+
+eval:
+  episodes: 50
+  seed_base: 900000              # fixed eval seed list = seed_base + i (disjoint from training seeds)
+  forgetting_tasks: [CloseFridge, OpenDrawer, TurnOnSinkFaucet, PickPlaceCounterToCabinet, TurnOnMicrowave]
+
+seeds:
+  offline: 100000
+  warmup: 200000
+  online: 300000
+  stage2: 500000

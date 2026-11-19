@@ -1,0 +1,5 @@
+task:
+  env_name: CoffeeSetupMug
+  layout_id: 11          # fixed scene (reused from the earlier xr1_fixed buffers)
+  style_id: 34
+  stages: [success]      # atomic: single specialist

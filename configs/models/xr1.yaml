@@ -1,0 +1,10 @@
+base:
+  kind: xr1
+  model_path: XiaomiRobotics/Xiaomi-Robotics-1-RoboCasa365
+  host: 127.0.0.1
+  port: 22000
+  exec_steps: 16           # XR1 RC365 eval: replan every 16 steps
+  chunk_len: 16
+  history_indices: [-6, -4, -2, 0]   # obs_history=4, obs_interval=2
+  crop_ratio: 0.95
+  num_steps: 5

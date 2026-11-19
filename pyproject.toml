@@ -1,0 +1,23 @@
+[project]
+name = "pld-rc365"
+version = "0.1.0"
+description = "PLD (Probe-Learn-Distill, arXiv 2511.00091) on RoboCasa365 with RLDX-1 / Xiaomi-Robotics-1"
+requires-python = ">=3.10"
+# The PLD process (envs + residual RL + data writer). The two VLA servers run in
+# their own venvs (see README) and only need `pyzmq` + `numpy` on top of their own deps.
+dependencies = [
+    "numpy",
+    "pyyaml",
+    "pyzmq",
+    "torch>=2.2",
+    "timm>=0.9.12",
+    "pandas",
+    # cv2 comes from robosuite/robocasa (installing a second opencv wheel would clash)
+]
+
+[project.optional-dependencies]
+sft = ["peft>=0.13", "transformers==4.57.1", "accelerate", "av", "pyarrow"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["pld_rc365*"]

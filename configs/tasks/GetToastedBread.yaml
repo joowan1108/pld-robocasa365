@@ -1,0 +1,7 @@
+task:
+  env_name: GetToastedBread
+  layout_id: null        # TODO: fill from `python -m pld_rc365.stage0_baseline --sweep` (both models, base SR ~15-70%)
+  style_id: null
+  # Per-stage specialists (paper's long-horizon real-world recipe). `wait` is base-only.
+  stages: [press, wait, pick, place]
+  base_only_stages: [wait]
