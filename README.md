@@ -125,8 +125,8 @@ on the lab PC.
   (L40S / A6000). `timing.json` records the GPU, so report it alongside the SFT time.
 
 ```bash
-# put the code on the instance (GitHub clone, or from the PC:  tar --exclude=runs -czf - . | ssh -p PORT root@IP "mkdir -p /workspace/residual && tar xzf - -C /workspace/residual")
-cd /workspace/residual
+cd /workspace && git clone https://github.com/joowan1108/pld-robocasa365.git residual && cd residual
+# (if the host blocks GitHub, from the PC:  git archive HEAD | ssh -p PORT root@IP "mkdir -p /workspace/residual && tar xf - -C /workspace/residual")
 bash scripts/vast_setup.sh && source vast.env      # adds pyzmq/timm/peft/... to the baked envs, writes vast.env
 bash scripts/run_experiment1.sh                    # unattended, resumable; starts/stops the VLA server itself
 ```
