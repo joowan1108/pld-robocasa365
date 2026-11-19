@@ -44,6 +44,16 @@ fi
 if [[ ! -f $R/eval/base.json ]]; then
   step "base eval (fixed/pretrain/target)"; "$PY" -m pld_rc365.eval --model "$MODEL" --task "$TASK" --tag base "${SET[@]}"
 fi; need "$R/eval/base.json"
+# Sanity gate before any expensive step: a near-zero base SR almost always means an image/state/action format
+# bug in the harness (published XR1 SR on random pretrain kitchens: CoffeeSetupMug 25/50).
+BASE_MIN_SR="${BASE_MIN_SR:-0.10}"
+"$PY" - "$R/eval/base.json" "$BASE_MIN_SR" <<'PYGATE' || { echo "[x] base SR gate failed -- check $R/eval/base.json; override with BASE_MIN_SR=0"; exit 1; }
+import json, sys
+d = json.load(open(sys.argv[1])); th = float(sys.argv[2])
+sr = {k: v["success_rate"] for k, v in d.items()}
+print("[i] base SR:", {k: round(v, 3) for k, v in sr.items()}, "| kitchens:", {k: v.get("n_distinct_scenes") for k, v in d.items()})
+sys.exit(0 if sr.get("pretrain", 0.0) >= th or sr.get("fixed", 0.0) >= th else 1)
+PYGATE
 if [[ ! -f $R/eval/base_other.json ]]; then
   step "base forgetting eval"; "$PY" -m pld_rc365.eval --model "$MODEL" --task "$TASK" --tag base --other-tasks "${SET[@]}"
 fi; need "$R/eval/base_other.json"

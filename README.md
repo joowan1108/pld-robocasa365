@@ -124,6 +124,13 @@ on the lab PC.
 * **Stage 3:** XR1 LoRA SFT is tight on a 24 GB card. Try `PER_DEV=1`, or run Stage 3 on a 48 GB card
   (L40S / A6000). `timing.json` records the GPU, so report it alongside the SFT time.
 
+**Fully automatic:** make a Vast template with the On-start script from [`docs/VAST_TEMPLATE.md`](docs/VAST_TEMPLATE.md)
+(the same image, a different On-start). Renting an instance then runs clone → deps → downloads → experiment 1 with
+no manual steps. Watch it with `tail -f /workspace/autorun.log`. The run stops before Stage 1 if base SR is below
+`BASE_MIN_SR`.
+
+Manual, equivalent:
+
 ```bash
 cd /workspace && git clone https://github.com/joowan1108/pld-robocasa365.git residual && cd residual
 # (if the host blocks GitHub, from the PC:  git archive HEAD | ssh -p PORT root@IP "mkdir -p /workspace/residual && tar xf - -C /workspace/residual")
