@@ -217,6 +217,17 @@ lazily, so memory grows with what is actually stored.
   * a right-padded batch matches per-sample results;
   * LoRA and projector gradients flow;
   * the merged checkpoint reloads.
+* **Harness checks (no GPU, no model needed; run on 2026-11-20 on CPU with Mesa EGL, all passed):**
+  * `scripts/check_harness.py --task <T> --save h.npz`: our `RC365Env` and the official `RoboCasaGymEnv`,
+    given the same seed and actions, produce identical images (3 cams), state, instruction and success flags.
+    It also lists the kitchens sampled per scene mode (fixed → only (11, 34); pretrain/target → varying).
+    Checked on all three tasks.
+  * `scripts/check_xr1_inputs.py --npz h.npz --entry <Xiaomi-Robotics-1>/eval_robocasa365 --model-path <xr1>`:
+    our XR1 server builds tensors bit-identical to the official `entry.py` client (input_ids, video pixels,
+    grid, state, action_mask).
+  * `pld_rc365/base/dummy_server.py`: a model-free server that validates every request (shapes, dtypes, unit
+    quaternions, instruction) and dumps the first one. Running `pld_rc365.eval` against it runs the full eval
+    path end to end.
 * **On the server, before Stage 1:**
   1. Base SR on random pretrain scenes should be roughly in line with the published per-task numbers
      (XR1: CoffeeSetupMug 25/50, GetToastedBread 18/50, SteamInMicrowave 32/50 on its seeds). This catches
