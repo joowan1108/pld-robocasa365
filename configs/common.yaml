@@ -55,7 +55,10 @@ rl:                          # Table 5
   offline_successes: 50      # n in Alg. 1
   calql:
     steps: 20000
-    alpha: 5.0          # CQL weight (not given in the paper; see scripts/calql_sweep.py for the calibration check)
+    alpha: 0.0          # CQL weight. Paper Fig. 14 compares Cal-QL alpha in {0.0, 0.5, 1.0} (all similar; value used for
+                        # the main runs not stated). Calibration check on the XR1 x CoffeeSetupMug offline buffer (20k
+                        # steps, scripts/calql_sweep.py): alpha=0.0 -> Q(data) vs MC corr 0.95, stable; 0.5 / 1.0 ->
+                        # Q of any non-zero residual -11..-20 (offline data are all residual-free), oscillating.
     num_samples: 10
     random: full        # full: U[-1,1]^d (standard) | residual: a_b + U[-xi,xi]^d
   device: cuda:0
