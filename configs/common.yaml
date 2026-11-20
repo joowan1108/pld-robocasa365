@@ -24,11 +24,14 @@ probing:
 
 residual:
   dims: 7                    # eef dpos(3) + drot(3) + gripper(1); base/torso/mode pass through
-  xi: 0.5                    # final residual magnitude bound (Table 5, B.2: 0.5 for LIBERO)
-  xi_schedule: linear        # constant | linear. Paper §3.1: "tuned by a scheduler" -- start small so early
-                             # exploration stays near pi_b (B.2: large xi at the start hurts), grow to xi.
-  xi_start: 0.1              # (B.2 suggests 0.1 for SimplerEnv; used here as the conservative start)
-  xi_ramp_steps: 50000       # residual-acted online steps to reach xi (form/length not given in the paper)
+  xi: 0.1                    # residual magnitude bound. Paper: 0.5 for LIBERO, 0.1 for SimplerEnv (B.2, Fig. 13).
+                             # RoboCasa VLA steps are small (|a| ~0.1-0.2 position, 0.03-0.08 rotation; RC365 demo
+                             # std 0.32-0.37 / 0.09-0.10). With a linear ramp to 0.5 the learned residual was 2-4x the
+                             # VLA action on position and 4-10x on rotation, 36-57% at the bound, and takeover SR fell
+                             # from a 0.62 base-only baseline to 0.14 (XR1 x CoffeeSetupMug, first run). Chosen: 0.1.
+  xi_schedule: constant      # constant | linear (paper: "tuned by a scheduler", form not given)
+  xi_start: 0.1              # only for linear
+  xi_ramp_steps: 50000       # only for linear: residual-acted online steps to reach xi
   image_size: 128
   cameras: [robot0_agentview_left, robot0_eye_in_hand]
 
