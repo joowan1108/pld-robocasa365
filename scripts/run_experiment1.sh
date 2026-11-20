@@ -39,7 +39,8 @@ PYMEM
 )
 RAM_ENVS=$(( (MEM_GB - 20) * 10 / 65 )); (( RAM_ENVS >= 1 )) || RAM_ENVS=1
 NUM_ENVS="${NUM_ENVS:-$(( ENVS_PER_GPU * REPLICAS < RAM_ENVS ? ENVS_PER_GPU * REPLICAS : RAM_ENVS ))}"
-export PLD_EGL_DEVICES="${PLD_EGL_DEVICES:-$(seq -s, 0 $((GPUS > 0 ? GPUS - 1 : 0)))}"
+# 1 GPU: leave EGL device selection to robosuite (default device, as on the DSRL runs); 2+: spread envs
+if (( GPUS >= 2 )); then export PLD_EGL_DEVICES="${PLD_EGL_DEVICES:-$(seq -s, 0 $((GPUS - 1)))}"; fi
 DEFAULT_SET="base.replicas=$REPLICAS env.num_envs=$NUM_ENVS rl.device=cuda:$((GPUS > 0 ? GPUS - 1 : 0))"
 start_servers() {  # $1 = model path
   for ((r = 0; r < REPLICAS; r++)); do bash scripts/server.sh start "$MODEL" "$1" "$((r % (GPUS > 0 ? GPUS : 1)))" "$r"; done
@@ -53,7 +54,7 @@ SFT_DIR="runs/$MODEL/_sft/pld${N}_${TASK}"
 
 need() { [[ -e $1 ]] || { echo "[x] step did not produce $1 -- stopping"; exit 1; }; }
 step() { echo; echo "=== $(date '+%F %T') $*"; }
-echo "[i] $MODEL x $TASK | GPUs=$GPUS replicas=$REPLICAS envs=$NUM_ENVS (host RAM ${MEM_GB} GB) | overrides: ${SET[*]} | EGL: $PLD_EGL_DEVICES"
+echo "[i] $MODEL x $TASK | GPUs=$GPUS replicas=$REPLICAS envs=$NUM_ENVS (host RAM ${MEM_GB} GB) | overrides: ${SET[*]} | EGL: ${PLD_EGL_DEVICES:-default}"
 
 if [[ ! -f $R/eval/base.json || ! -f $R/eval/base_other.json || ! -f $R/stage1/specialists_final.pt \
       || ! -f runs/pld_data/$MODEL/${TASK}_pld${N}/lerobot/meta/info.json ]]; then

@@ -235,7 +235,10 @@ def _worker(remote, parent_remote, spec_kwargs: dict, record_root: str | None, g
     parent_remote.close()
     os.environ.setdefault("MUJOCO_GL", gl)
     if egl_device is not None:
-        os.environ["MUJOCO_EGL_DEVICE_ID"] = egl_device
+        # robosuite asserts MUJOCO_EGL_DEVICE_ID is listed in CUDA_VISIBLE_DEVICES when the latter is set
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if not cvd or egl_device in cvd.split(","):
+            os.environ["MUJOCO_EGL_DEVICE_ID"] = egl_device
     env = RC365Env(EnvSpec(**spec_kwargs), record_root=record_root)
     try:
         while True:
