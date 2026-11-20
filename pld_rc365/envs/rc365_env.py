@@ -232,6 +232,9 @@ class RC365Env:
 
 # ---------------------------------------------------------------------------- subprocess vec env
 def _worker(remote, parent_remote, spec_kwargs: dict, record_root: str | None, gl: str, egl_device: str | None):
+    from ..utils.threads import limit_threads
+
+    limit_threads(1)  # MuJoCo stepping is single-threaded; avoid one OpenMP thread per host core per worker
     parent_remote.close()
     os.environ.setdefault("MUJOCO_GL", gl)
     if egl_device is not None:
@@ -269,8 +272,15 @@ class VecEnv:
         import multiprocessing as mp
         from dataclasses import asdict
 
+        import os
+
+        from ..utils.threads import _VARS
+
         ctx = mp.get_context("spawn")
         self.num_envs = num_envs
+        saved = {v: os.environ.get(v) for v in _VARS}
+        for v in _VARS:  # children inherit the environment at spawn: 1 thread each
+            os.environ[v] = "1"
         self.remotes, self.procs = [], []
         for i in range(num_envs):
             remote, work_remote = ctx.Pipe()
@@ -280,6 +290,11 @@ class VecEnv:
             work_remote.close()
             self.remotes.append(remote)
             self.procs.append(p)
+        for v, val in saved.items():
+            if val is None:
+                os.environ.pop(v, None)
+            else:
+                os.environ[v] = val
         self.remotes[0].send(("horizon", None))
         self.horizon = self.remotes[0].recv()
 

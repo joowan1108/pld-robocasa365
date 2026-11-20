@@ -32,6 +32,9 @@ def sample_t_base(cfg: dict, horizon: int, rng: np.random.Generator) -> int:
 
 def build_env_and_base(cfg: dict, scene: str = "fixed", task: str | None = None, record_root: str | None = None,
                        num_envs: int | None = None, port: int | None = None, host: str | None = None):
+    from .utils.threads import limit_threads
+
+    limit_threads()
     os.environ.setdefault("MUJOCO_GL", cfg["env"].get("mujoco_gl", "egl"))
     spec = make_spec(cfg, scene=scene, task=task)
     n = int(num_envs or cfg["env"]["num_envs"])

@@ -41,7 +41,12 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    from pld_rc365.utils.threads import limit_threads
+
+    limit_threads()  # env vars were already set when the pld_rc365 package was imported (before torch)
     import torch
+
+    torch.set_num_threads(int(__import__("os").environ.get("OMP_NUM_THREADS", "4")))
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)

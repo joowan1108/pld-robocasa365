@@ -102,7 +102,12 @@ def main():
                     help="MiBoT supports flash_attention_2 or eager only (no sdpa); use eager if flash-attn won't build")
     args = ap.parse_args()
 
+    from pld_rc365.utils.threads import limit_threads
+
+    limit_threads()  # env vars were already set when the pld_rc365 package was imported (before torch)
     import torch
+
+    torch.set_num_threads(int(__import__("os").environ.get("OMP_NUM_THREADS", "4")))
     from transformers import AutoModel, AutoProcessor
 
     processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True, use_fast=False)
