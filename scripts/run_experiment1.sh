@@ -75,15 +75,16 @@ sr = {k: v["success_rate"] for k, v in d.items()}
 print("[i] base SR:", {k: round(v, 3) for k, v in sr.items()}, "| kitchens:", {k: v.get("n_distinct_scenes") for k, v in d.items()})
 sys.exit(0 if sr.get("pretrain", 0.0) >= th or sr.get("fixed", 0.0) >= th else 1)
 PYGATE
-if [[ ! -f $R/eval/base_other.json ]]; then
-  step "base forgetting eval"; "$PY" -m pld_rc365.eval --model "$MODEL" --task "$TASK" --tag base --other-tasks "${SET[@]}"
-fi; need "$R/eval/base_other.json"
 if [[ ! -f $R/stage1/specialists_final.pt ]]; then
   step "stage 1"; "$PY" -m pld_rc365.stage1_train --model "$MODEL" --task "$TASK" "${SET[@]}"
 fi; need "$R/stage1/specialists_final.pt"
 if [[ ! -f runs/pld_data/$MODEL/${TASK}_pld${N}/lerobot/meta/info.json ]]; then
   step "stage 2"; "$PY" -m pld_rc365.stage2_collect --model "$MODEL" --task "$TASK" "${SET[@]}" "stage2.target_successes=$N"
 fi; need "runs/pld_data/$MODEL/${TASK}_pld${N}/lerobot/meta/info.json"
+# base forgetting check runs after stage 2 (same base server, before SFT) so residual RL starts sooner
+if [[ ! -f $R/eval/base_other.json ]]; then
+  step "base forgetting eval"; "$PY" -m pld_rc365.eval --model "$MODEL" --task "$TASK" --tag base --other-tasks "${SET[@]}"
+fi; need "$R/eval/base_other.json"
 bash scripts/server.sh stop "$MODEL"
 
 if [[ $MODEL == xr1 ]]; then SERVE="$SFT_DIR/merged"; else SERVE=""; fi
