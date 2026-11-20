@@ -94,7 +94,12 @@ class ResidualActor(nn.Module):
         self.act_dim = act_dim
 
     def forward(self, feats, proprio, a_base, xi: float, deterministic: bool = False, with_logprob: bool = True):
-        """Returns a_delta in [-xi, xi]^d and log pi(a_delta) (density w.r.t. a_delta, incl. the xi scaling)."""
+        """Returns a_delta = xi * tanh(u) in [-xi, xi]^d and log pi of the *normalised* residual tanh(u) in [-1, 1]^d.
+
+        The density is deliberately not divided by xi^d: SAC's target entropy (-act_dim/2) assumes a unit action
+        box, and with the xi schedule the maximum entropy of a_delta itself is d*log(2*xi) (-11.3 at xi=0.1), below
+        the target, so the temperature diverged (first XR1 run: alpha 1 -> 54 during warm-up). Use
+        `logp - d*log(xi)` where a density over a_delta is needed (Cal-QL importance weights)."""
         h = self.trunk(self.encoder(feats, proprio, a_base))
         mu, log_std = h.chunk(2, dim=-1)
         log_std = log_std.clamp(LOG_STD_MIN, LOG_STD_MAX)
@@ -106,7 +111,6 @@ class ResidualActor(nn.Module):
         if with_logprob:
             logp = (-0.5 * ((u - mu) / std) ** 2 - log_std - 0.5 * math.log(2 * math.pi)).sum(-1)
             logp = logp - (2 * (math.log(2) - u - F.softplus(-2 * u))).sum(-1)  # tanh correction
-            logp = logp - self.act_dim * math.log(max(xi, 1e-8))               # xi scaling
         return a_delta, logp
 
 

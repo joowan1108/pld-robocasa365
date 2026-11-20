@@ -271,3 +271,35 @@ def test_pipelined_queries_keep_transitions_aligned():
     # per transition, the fake encodes the env step each action was meant for: next = this + 1
     np.testing.assert_allclose(nab, ab + 1, atol=1e-3)
     assert base.n_requests < base.n_queries     # some requests carried several envs
+
+
+def test_entropy_is_defined_on_the_normalised_residual_so_target_is_reachable():
+    """log pi must not depend on xi: with the xi ramp starting at 0.1 the entropy of a_delta itself is at most
+    7*log(0.2) = -11.3 < target -3.5, which made the temperature diverge on the first real run."""
+    sp = make_spec_obj(0)
+    f = torch.randn(64, 2, *FMAP).half()
+    p, ab = torch.randn(64, 16), torch.rand(64, 12) * 2 - 1
+    torch.manual_seed(0)
+    a1, lp1 = sp.agent.actor(f, p, ab, 0.1)
+    torch.manual_seed(0)
+    a5, lp5 = sp.agent.actor(f, p, ab, 0.5)
+    torch.testing.assert_close(lp1, lp5)
+    torch.testing.assert_close(a1 * 5, a5, rtol=1e-5, atol=1e-6)
+    # a wide policy reaches entropies above the target, so the temperature loss can change sign
+    with torch.no_grad():
+        last = sp.agent.actor.trunk[-1]
+        last.weight.zero_()
+        last.bias.zero_()
+        last.bias[7:] = -0.14        # std ~0.87: tanh(N(0, 0.87)) is close to uniform on [-1, 1] (entropy ~ +4.6)
+    _, lp = sp.agent.actor(f, p, ab, 0.1)
+    assert (-lp.mean()).item() > sp.agent.target_entropy
+
+
+def test_reserve_gpu_memory_is_a_noop_for_weights():
+    sp = make_spec_obj(0)
+    sp.agent.device = torch.device("cuda")          # exercise the code path on CPU tensors
+    sp.agent._to_t = lambda b: {k: torch.as_tensor(v) for k, v in b.items()}
+    before = {k: v.clone() for k, v in sp.agent.critic.state_dict().items()}
+    sp.agent.reserve_gpu_memory()
+    assert all(torch.equal(before[k], v) for k, v in sp.agent.critic.state_dict().items())
+    assert all(p.grad is None for p in sp.agent.critic.parameters())

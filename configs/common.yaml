@@ -13,8 +13,9 @@ env:
   # EGL rendering of a RoboCasa kitchen (3 cams) takes ~1.15 GB of GPU memory per env (measured on a 4090).
   # When a stage starts, num_envs is capped to what fits next to whatever is already on the GPU (the VLA server).
   cap_envs_by_gpu_mem: true
-  gpu_mem_per_env_gb: 1.2
-  gpu_mem_reserve_train_gb: 2.0   # residual learner + collector actor (stage 1 / 2)
+  gpu_mem_per_env_gb: 1.1
+  gpu_mem_reserve_train_gb: 4.0   # residual learner (~1.5 GB) + growth of the VLA server under batched inference
+                                  # (~2 GB); 9 envs with a 2 GB reserve reached 24.0/24.5 GB on a 4090
   gpu_mem_reserve_eval_gb: 0.5
 
 probing:
@@ -54,8 +55,9 @@ rl:                          # Table 5
   offline_successes: 50      # n in Alg. 1
   calql:
     steps: 20000
-    alpha: 5.0
+    alpha: 5.0          # CQL weight (not given in the paper; see scripts/calql_sweep.py for the calibration check)
     num_samples: 10
+    random: full        # full: U[-1,1]^d (standard) | residual: a_b + U[-xi,xi]^d
   device: cuda:0
 
 stage1:

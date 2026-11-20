@@ -88,6 +88,8 @@ def main():
     backbone, fmap_shape, n_cams = build_backbone(cfg)
     stage_ids = learnable_stage_ids(cfg)
     specs = build_specialists(cfg, fmap_shape, n_cams, stage_ids)
+    for sp in specs.values():
+        sp.agent.reserve_gpu_memory()
     runner = make_runner(cfg, venv, base, backbone, specs, K)
     rng = np.random.default_rng(cfg["seeds"]["online"])
 

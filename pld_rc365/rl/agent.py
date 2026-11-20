@@ -125,22 +125,36 @@ class ResidualSAC:
 
     def _calql_term(self, b, z, q_data, xi):
         """Cal-QL (Nakamoto et al. 2024): CQL(H) with policy-action Q-values lower-bounded by MC returns.
-        Random actions are drawn uniformly from the residual support a_b + U[-xi, xi]."""
-        n = int(self.rl["calql"]["num_samples"])
+
+        rl.calql.random selects where the "random" actions come from:
+          full     : uniform over the whole action box [-1, 1]^d (standard CQL / Cal-QL)
+          residual : a_b + U[-xi, xi]^d, i.e. the residual policy's support. These sit right next to the data
+                     action and are not calibrated, so they drag Q(s, a_data) and the TD target down
+                     (first XR1 run, alpha=5: Q(data) -4.5, TD target -7 for 0/1 rewards).
+        All densities are w.r.t. the executed action a_bar (policy log-prob converted with -d*log(xi))."""
+        cq = self.rl["calql"]
+        n = int(cq["num_samples"])
         B = z.shape[0]
         rep = lambda x: x.repeat_interleave(n, 0)  # noqa: E731
         zr, ab = rep(z), rep(b["a_b"])
         d = self.act_dim
-        # uniform residuals
-        u = (torch.rand(B * n, d, device=self.device) * 2 - 1) * xi
-        q_rand = self.critic(None, None, None, combine(ab, u, d), z=zr)
-        log_dens_rand = -d * math.log(2 * xi)
+        if cq.get("random", "full") == "full":
+            a_rand = torch.rand(B * n, d, device=self.device) * 2 - 1
+            log_dens_rand = -d * math.log(2.0)
+        else:
+            a_rand = combine(ab, (torch.rand(B * n, d, device=self.device) * 2 - 1) * xi, d)
+            log_dens_rand = -d * math.log(2 * xi)
+        q_rand = self.critic(None, None, None, a_rand, z=zr)
+        to_abar = -d * math.log(max(xi, 1e-8))
         with torch.no_grad():
             a_pi, logp_pi = self.actor(rep(b["feat"]), rep(b["proprio"]), ab, xi)
             a_nx, logp_nx = self.actor(rep(b["next_feat"]), rep(b["next_proprio"]), rep(b["next_a_b"]), xi)
+            logp_pi, logp_nx = logp_pi + to_abar, logp_nx + to_abar
         q_pi = self.critic(None, None, None, combine(ab, a_pi, d), z=zr)
         q_nx = self.critic(None, None, None, combine(ab, a_nx, d), z=zr)
         mc = rep(b["mc_return"])[None]
+        info = {"q_pi": q_pi.mean().item(), "q_rand": q_rand.mean().item(), "mc_return": b["mc_return"].mean().item(),
+                "calib_binds": (q_pi < mc).float().mean().item()}
         q_pi = torch.maximum(q_pi, mc)   # Cal-QL calibration
         q_nx = torch.maximum(q_nx, mc)
         cat = torch.cat([
@@ -150,7 +164,8 @@ class ResidualSAC:
         ], dim=-1)
         lse = torch.logsumexp(cat, dim=-1)  # (num_q, B)
         cql = (lse - q_data).mean(-1).sum()
-        return cql, {"cql_gap": (lse - q_data).mean().item()}
+        info["cql_gap"] = (lse - q_data).mean().item()
+        return cql, info
 
     def actor_loss(self, b, xi):
         a_d, logp = self.actor(b["feat"], b["proprio"], b["a_b"], xi)
@@ -180,6 +195,27 @@ class ResidualSAC:
             self.alpha_opt.step()
             info.update(ainfo, actor_loss=aloss.item())
         return info
+
+    def reserve_gpu_memory(self) -> None:
+        """Run the largest forward/backward once on dummy data (no optimizer step, weights unchanged) so the CUDA
+        allocator claims the learner's memory before the env renderers fill the GPU."""
+        if self.device.type != "cuda":
+            return
+        a, B, rng = self._arch, self.batch, np.random.default_rng(0)
+        feat = (a["n_cams"], *a["fmap_shape"])
+        b = self._to_t({
+            "feat": rng.standard_normal((B, *feat)).astype(np.float16), "next_feat": rng.standard_normal((B, *feat)).astype(np.float16),
+            "proprio": np.zeros((B, a["proprio_dim"]), np.float32), "next_proprio": np.zeros((B, a["proprio_dim"]), np.float32),
+            "a_b": np.zeros((B, a["base_dim"]), np.float32), "next_a_b": np.zeros((B, a["base_dim"]), np.float32),
+            "a_bar": np.zeros((B, self.act_dim), np.float32), "reward": np.zeros(B, np.float32),
+            "done": np.zeros(B, np.float32), "mc_return": np.zeros(B, np.float32),
+        })
+        closs, _ = self.critic_loss(b, self.xi, calql_alpha=1.0)
+        closs.backward()
+        aloss, _, _ = self.actor_loss(b, self.xi)
+        aloss.backward()
+        for opt in (self.critic_opt, self.actor_opt, self.alpha_opt):
+            opt.zero_grad(set_to_none=True)
 
     def pretrain_calql(self, offline: ReplayBuffer, steps: int, log_fn=None):
         alpha = float(self.rl["calql"]["alpha"])
