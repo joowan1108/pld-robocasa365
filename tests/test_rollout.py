@@ -224,3 +224,18 @@ def test_consistency_check_catches_chunk_desync():
     base.pop = bad_pop
     with pytest.raises(RuntimeError, match="chunk desync"):
         run_n(runner, [EpisodeSpec(seed=1, mode="pld", t_base=2, store="online")], 1)
+
+
+def test_consistency_check_allows_out_of_range_base_actions():
+    runner, venv, base, specs = make_runner(num_envs=1, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    orig_ensure = base.ensure
+
+    def ensure(idxs):
+        orig_ensure(idxs)
+        for i in idxs:
+            for a in base.q[i]:
+                a[6] = 1.3      # VLA gripper slightly beyond +1
+                a[1] = -1.2
+    base.ensure = ensure
+    for mode, tb in (("base", 0), ("pld", 3)):
+        run_n(runner, [EpisodeSpec(seed=1, mode=mode, t_base=tb, store="online")], 1)

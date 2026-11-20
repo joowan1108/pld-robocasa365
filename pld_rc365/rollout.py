@@ -291,7 +291,9 @@ class Runner:
         d = self.d
         if not np.array_equal(np.asarray(popped), a_b):
             raise RuntimeError(f"env {i}: chunk desync, used a_b {a_b} but queue popped {popped}")
-        if not np.allclose(action[:d], a_bar, atol=1e-6):
+        # the VLA may emit values slightly outside [-1, 1]; the OSC controller clips its input and the gripper is
+        # thresholded, so the stored a_bar is the clipped version of what was sent
+        if not np.allclose(np.clip(action[:d], -1.0, 1.0), a_bar, atol=1e-6):
             raise RuntimeError(f"env {i}: stored a_bar {a_bar} != executed arm action {action[:d]}")
         if not np.array_equal(action[d:], a_b[d:]):
             raise RuntimeError(f"env {i}: base/torso/mode dims changed: {action[d:]} vs a_b {a_b[d:]}")
