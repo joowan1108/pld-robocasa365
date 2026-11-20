@@ -83,7 +83,8 @@ def main():
         kind, alpha = v.split(":")
         alpha = float(alpha)
         rl = copy.deepcopy(cfg["rl"])
-        rl["calql"]["random"] = "full" if kind == "none" else kind
+        rl["calql"]["form"] = "paper" if kind == "paper" else "cqlh"      # paper:<alpha> = PLD App. B.1 form
+        rl["calql"]["random"] = "full" if kind in ("none", "paper") else kind
         agent = ResidualSAC(rl, cfg["residual"], fmap, n_cams, device=rl["device"], seed=0)
         t0 = time.time()
         hist = []

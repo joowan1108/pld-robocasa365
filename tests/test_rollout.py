@@ -327,3 +327,36 @@ def test_critic_input_follows_paper_eq2():
     assert torch.equal(z1, z2)                                   # Q does not depend on a_b, only on a_bar
     ag2 = ResidualSAC({**rl, "critic_uses_a_b": True}, res, (4, 2, 2), 2, device="cpu")
     assert ag2.critic.encoder.base_action_dim == 12
+
+
+def test_calql_paper_form_matches_appendix_b1():
+    import numpy as np
+    import torch
+    from pld_rc365.rl.agent import ResidualSAC
+    rl = {"discount": 0.99, "tau": 0.005, "batch_size": 6, "target_entropy_scale": 0.5, "hidden_dim": 16,
+          "latent_dim": 8, "num_spatial_features": 2, "num_q": 2, "lr": 3e-4, "init_temperature": 1.0,
+          "grad_clip": 1.0, "critic_actor_ratio": 2, "calql": {"form": "paper", "num_samples": 4, "alpha": 1.0}}
+    res = {"dims": 7, "xi": 0.1, "xi_schedule": "constant"}
+    ag = ResidualSAC(rl, res, (4, 2, 2), 2, device="cpu")
+    rng = np.random.default_rng(0)
+    B = 6
+    b = {"feat": rng.standard_normal((B, 2, 4, 2, 2)).astype(np.float32), "next_feat": rng.standard_normal((B, 2, 4, 2, 2)).astype(np.float32),
+         "proprio": rng.standard_normal((B, 16)).astype(np.float32), "next_proprio": rng.standard_normal((B, 16)).astype(np.float32),
+         "a_b": rng.uniform(-.5, .5, (B, 12)).astype(np.float32), "next_a_b": rng.uniform(-.5, .5, (B, 12)).astype(np.float32),
+         "a_bar": rng.uniform(-.5, .5, (B, 7)).astype(np.float32), "reward": np.zeros(B, np.float32),
+         "done": np.zeros(B, np.float32), "mc_return": np.full(B, 100.0, np.float32)}
+    t = ag._to_t(b)
+    z = ag.critic.encoder(t["feat"], t["proprio"], t["a_b"])
+    q = ag.critic(None, None, None, t["a_bar"], z=z)
+    # V^mu far above any Q: every policy-action Q is floored -> term = sum_heads mean(V^mu - Q(s, a_data)),
+    # and the push-down has no gradient (only Q(s, a_data) is pushed up).
+    cql, info = ag._calql_term_paper(t, z, q, 0.1)
+    assert info["calib_binds"] == 1.0
+    assert torch.allclose(cql, (100.0 - q).mean(-1).sum(), atol=1e-4)
+    # V^mu far below: term = mean over policy samples of Q(s, a_pi) - Q(s, a_data); finite, has gradient
+    t["mc_return"] = torch.full((B,), -100.0)
+    cql2, info2 = ag._calql_term_paper(t, z, q, 0.1)
+    assert info2["calib_binds"] == 0.0 and torch.isfinite(cql2)
+    assert abs(info2["cql_gap"] - (info2["q_pi"] - q.mean().item())) < 1e-4
+    out = ag.update(b, calql_alpha=1.0)                 # full update runs with the paper form
+    assert np.isfinite(out["critic_loss"]) and "q_rand" not in out

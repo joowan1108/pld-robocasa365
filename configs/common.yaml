@@ -68,8 +68,12 @@ rl:                          # Table 5
                         # a_bar == a_b, so the unconstrained critic credits the action input with the progress signal.
                         # Takeover SR fell 0.68 -> 0.12 (baseline 0.58). The conservative term penalises exactly these
                         # out-of-data actions (alpha=1.0: Q(random residual) ~ -11 after pre-training).
-    num_samples: 10
-    random: full        # full: U[-1,1]^d (standard) | residual: a_b + U[-xi,xi]^d
+    form: paper         # paper: PLD App. B.1 as written -- alpha*(E_{a~pi}[max(Q(s,a), V^mu(s))] - Q(s,a_data)) + 1/2 TD^2,
+                        #        policy actions only, floored at the MC return.
+                        # cqlh : the Cal-QL code base's CQL(H) (log-sum-exp over uniform random + policy actions). Used
+                        #        by the first runs: Q(random) fell to -30 (no floor), Q(data) oscillated (-1.7..+1.0).
+    num_samples: 10     # policy-action samples per state
+    random: full        # cqlh only. full: U[-1,1]^d | residual: a_b + U[-xi,xi]^d
   device: cuda:0
 
 stage1:

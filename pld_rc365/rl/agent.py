@@ -122,13 +122,41 @@ class ResidualSAC:
         loss = sum(F.mse_loss(qi, y) for qi in q)
         info = {"q": q.mean().item(), "td_target": y.mean().item()}
         if calql_alpha > 0:
-            cql, cinfo = self._calql_term(b, z, q, xi)
-            loss = loss + calql_alpha * cql
+            if self.rl["calql"].get("form", "paper") == "paper":
+                cql, cinfo = self._calql_term_paper(b, z, q, xi)
+                loss = 0.5 * loss + calql_alpha * cql      # App. B.1: alpha * (...) + 1/2 * TD^2
+            else:
+                cql, cinfo = self._calql_term(b, z, q, xi)
+                loss = loss + calql_alpha * cql
             info.update(cinfo)
         return loss, info
 
+    def _calql_term_paper(self, b, z, q_data, xi):
+        """Cal-QL exactly as written in the PLD paper (App. B.1):
+
+            E_{s~D, a~pi}[ max(Q(s, a), V^mu(s)) ] - E_{(s,a)~D}[ Q(s, a) ]
+
+        pi is the combined policy (a_b + pi_delta(s, a_b)); V^mu(s) is the Monte-Carlo return of the offline
+        (base-policy) trajectory at s. Only policy actions are pushed down, and never below V^mu -- no uniform random
+        actions and no log-sum-exp (those come from the Cal-QL code base's CQL(H) variant, see _calql_term)."""
+        n = int(self.rl["calql"]["num_samples"])
+        rep = lambda x: x.repeat_interleave(n, 0)  # noqa: E731
+        B = z.shape[0]
+        zr, ab = rep(z), rep(b["a_b"])
+        with torch.no_grad():
+            a_pi, _ = self.actor(rep(b["feat"]), rep(b["proprio"]), ab, xi)
+        q_pi = self.critic(None, None, None, combine(ab, a_pi, self.act_dim), z=zr)   # (num_q, B*n)
+        mc = rep(b["mc_return"])[None]
+        info = {"q_pi": q_pi.mean().item(), "mc_return": b["mc_return"].mean().item(),
+                "calib_binds": (q_pi < mc).float().mean().item()}
+        pushed = torch.maximum(q_pi, mc).view(-1, B, n).mean(-1)                       # (num_q, B)
+        gap = pushed - q_data
+        info["cql_gap"] = gap.mean().item()
+        return gap.mean(-1).sum(), info
+
     def _calql_term(self, b, z, q_data, xi):
-        """Cal-QL (Nakamoto et al. 2024): CQL(H) with policy-action Q-values lower-bounded by MC returns.
+        """rl.calql.form = cqlh: the Cal-QL code base's variant -- CQL(H) (log-sum-exp over uniform random actions and
+        policy actions) with policy-action Q-values lower-bounded by MC returns. Not the form written in the PLD paper.
 
         rl.calql.random selects where the "random" actions come from:
           full     : uniform over the whole action box [-1, 1]^d (standard CQL / Cal-QL)
