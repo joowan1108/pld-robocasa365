@@ -65,6 +65,9 @@ class FakeBase:
         self.n_queries = 0
         self.query_seconds = 0.0
         self.info = {"kind": "fake"}
+        self.n_requests = 0
+        self.delay = 0          # >0: a request completes only after this many non-blocking polls (async server)
+        self._pend = {}
 
     def reset_env(self, i, pkt):
         self.q[i].clear()
@@ -82,6 +85,41 @@ class FakeBase:
                     a[0] = (self.cur_t[i] + k) / 1000.0     # encodes the env step this action is meant for
                     a[6] = 1.0
                     self.q[i].append(a)
+
+    # async interface (requests complete on submit unless `delay` polls are configured)
+    @property
+    def queues(self):
+        return self.q
+
+    def has_action(self, i):
+        return bool(self.q[i])
+
+    def submit(self, idxs):
+        need = [i for i in idxs if not self.q[i] and i not in self._pend]
+        if not need:
+            return 0
+        if self.delay == 0:
+            self.ensure(need)
+            self.n_requests += 1
+            return len(need)
+        for i in need:
+            self._pend[i] = self.delay
+        return len(need)
+
+    def poll(self, block=False):
+        pend = self._pend
+        done = [i for i, d in pend.items() if block or d <= 1]
+        for i in list(pend):
+            pend[i] -= 1
+        if done:
+            for i in done:
+                pend.pop(i)
+            self.ensure(done)
+            self.n_requests += 1
+        return len(done)
+
+    def drain(self):
+        self.poll(block=True)
 
     def peek(self, i):
         return self.q[i][0].copy()

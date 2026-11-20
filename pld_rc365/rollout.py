@@ -99,6 +99,7 @@ class Runner:
         self.offline_accepted = 0
         self.abort_on_stop = True               # drop in-flight episodes once on_end requested a stop
         self.check_consistency = True           # cheap per-step invariants (bug guard, no effect on results)
+        self.log_every_s = 120.0                # throughput line on stdout
 
     # ------------------------------------------------------------------ helpers
     def _features(self, pkts: list[dict]) -> np.ndarray:
@@ -168,12 +169,27 @@ class Runner:
         for i in range(self.venv.num_envs):
             start(i)
 
+        t_log = time.time()
+        steps_at_log = self.stats["env_steps"]
         while states:
             if check is not None:
                 check()
-            active = sorted(states)
-            # 1. base actions for the current step
-            self.base.ensure(active)
+            # 1. base actions: pipelined queries -- envs without an action wait, the rest keep stepping
+            self.base.poll()
+            self.base.submit(sorted(states))
+            active = [i for i in sorted(states) if self.base.has_action(i)]
+            if not active:
+                t_w = time.time()
+                self.base.poll(block=True)
+                self.stats["wait_s"] = self.stats.get("wait_s", 0.0) + time.time() - t_w
+                continue
+            if self.log_every_s and time.time() - t_log >= self.log_every_s:
+                dt = time.time() - t_log
+                nreq = max(1, getattr(self.base, "n_requests", 1))
+                print(f"[runner] {(self.stats['env_steps'] - steps_at_log) / dt:.1f} env steps/s | "
+                      f"envs {len(states)} | mean query batch {self.base.n_queries / nreq:.1f} | "
+                      f"waiting {len(states) - len(active)}", flush=True)
+                t_log, steps_at_log = time.time(), self.stats["env_steps"]
             a_b = {i: self.base.peek(i) for i in active}
             # 2. finalise transitions waiting for next_a_b
             for i in active:
@@ -282,6 +298,7 @@ class Runner:
                     if states[i].spec.record:
                         self.venv.finish(i, False)
                     states.pop(i)
+        self.base.drain()  # leave no request in flight for the next run() (envs get reset there)
 
     def _check_step(self, i, popped, a_b, action, a_bar, pkt):
         """Invariants between what was stored and what was executed (raise on the first violation):

@@ -255,3 +255,19 @@ def test_cap_num_envs_by_free_gpu_memory(monkeypatch):
     assert common.cap_num_envs(cfg, 20, training=True) == 10 + 6
     monkeypatch.setattr(common, "_free_gpu_gb", lambda i: None)       # no nvidia-smi: leave as is
     assert common.cap_num_envs(cfg, 10, training=True) == 10
+
+
+def test_pipelined_queries_keep_transitions_aligned():
+    """Async server (replies arrive a few polls later): waiting envs are not stepped, the others keep going, and
+    every stored transition still has a_b = action used at t and next_a_b = action used at t+1."""
+    runner, venv, base, specs = make_runner(num_envs=3, horizon=20, stage_steps=(100,), succeed=lambda s: False)
+    base.delay = 3
+    specs_list = [EpisodeSpec(seed=s, mode="base", store="online") for s in (1, 3, 5, 7)]
+    run_n(runner, specs_list, 4)
+    buf = specs[0].online
+    assert buf.size == 4 * 20
+    ab = buf.data["a_b"][: buf.size, 0] * 1000
+    nab = buf.data["next_a_b"][: buf.size, 0] * 1000
+    # per transition, the fake encodes the env step each action was meant for: next = this + 1
+    np.testing.assert_allclose(nab, ab + 1, atol=1e-3)
+    assert base.n_requests < base.n_queries     # some requests carried several envs

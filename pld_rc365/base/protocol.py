@@ -60,7 +60,17 @@ class Client:
         self.sock.connect(self.addr)
 
     def call(self, req: dict) -> dict:
+        self.send(req)
+        return self.recv()
+
+    # async use (REQ socket: strictly send -> recv -> send ...)
+    def send(self, req: dict) -> None:
         self.sock.send(pickle.dumps(req, protocol=pickle.HIGHEST_PROTOCOL))
+
+    def ready(self) -> bool:
+        return bool(self.sock.poll(0, zmq.POLLIN))
+
+    def recv(self) -> dict:
         rep = pickle.loads(self.sock.recv())
         if "error" in rep:
             raise RuntimeError(f"base-policy server error: {rep['error']}")

@@ -56,3 +56,28 @@ def test_two_replicas_route_and_run_concurrently():
     assert seen == {0: [2], 1: [2]}                                # one batched request per replica
     assert dt < 0.55, dt                                           # concurrent (~0.3 s), not serial (~0.6 s)
     assert len(bp.queues[0]) == 8
+
+
+def test_async_submit_poll_with_real_server():
+    port = _free_port_pair()
+
+    def handler(batch):
+        time.sleep(0.3)
+        return np.ones((len(batch), 16, 12), np.float32) * len(batch)
+
+    srv = Server("127.0.0.1", port, handler, info={"kind": "fake"})
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    bp = BasePolicy("127.0.0.1", port, num_envs=3, exec_steps=8, replicas=1)
+    pkt = {"images": {c: np.zeros((8, 8, 3), np.uint8) for c in
+                      ("robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand")},
+           "state": {"base_position": np.zeros(3, np.float32)}, "lang": "x"}
+    for i in range(3):
+        bp.reset_env(i, pkt)
+    assert bp.submit([0, 1]) == 2          # one request with envs 0 and 1
+    assert bp.submit([2]) == 0             # replica busy: env 2 waits for the next round
+    assert bp.poll() == 0                  # not answered yet (non-blocking)
+    assert bp.poll(block=True) == 2
+    assert bp.has_action(0) and bp.has_action(1) and not bp.has_action(2)
+    assert bp.peek(0)[0] == 2              # answered as a batch of 2
+    bp.ensure([2])                         # synchronous path still works
+    assert bp.has_action(2) and bp.n_requests == 2

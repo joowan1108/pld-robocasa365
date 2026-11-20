@@ -5,14 +5,13 @@ Chunk handling (not specified in the paper): the VLA is queried when the env's q
 residual acts per env step on the current queue head a_b,t.
 
 Replicas: with N servers (one per GPU, ports port..port+N-1) env i is served by replica i % N and the replicas
-are queried concurrently, so N GPUs give ~N x base-policy throughput (XR1 serves envs one by one).
+are queried concurrently, so N GPUs give ~N x base-policy throughput.
 """
 
 from __future__ import annotations
 
 import collections
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -28,7 +27,9 @@ class BasePolicy:
         self.clients = [Client(host, port + r) for r in range(self.replicas)]
         infos = [c.call({"cmd": "info"}) for c in self.clients]
         self.info = {**infos[0], "replicas": infos}
-        self._pool = ThreadPoolExecutor(max_workers=self.replicas) if self.replicas > 1 else None
+        self._in_flight: dict[int, list[int]] = {}   # replica -> envs of its outstanding request
+        self._sent_at: dict[int, float] = {}
+        self.n_requests = 0
         self.exec_steps = int(exec_steps)
         self.hist_idx = list(history_indices)
         self.maxlen = 1 - min(self.hist_idx)
@@ -62,29 +63,61 @@ class BasePolicy:
             "lang": self.langs[i],
         }
 
-    def ensure(self, idxs) -> None:
-        """Query the server (one batched request) for every env in idxs whose queue is empty."""
-        need = [i for i in idxs if not self.queues[i]]
-        if not need:
-            return
-        t0 = time.time()
+    # ------------------------------------------------------------------ async (pipelined) queries
+    # One request in flight per replica. Envs whose queue ran out wait (they are not stepped) while the others keep
+    # stepping; whatever accumulates during a request is sent as the next batch. Each env still executes exactly its
+    # own chunk and replans at its own state -- only the order of computation changes.
+    def has_action(self, i: int) -> bool:
+        return bool(self.queues[i])
+
+    @property
+    def in_flight_envs(self) -> set[int]:
+        return {i for envs in self._in_flight.values() for i in envs}
+
+    def submit(self, idxs) -> int:
+        """Send requests for envs in idxs with an empty queue, on replicas that are idle. Returns #envs sent."""
+        busy = self.in_flight_envs
         groups: dict[int, list[int]] = {}
-        for i in need:
-            groups.setdefault(i % self.replicas, []).append(i)
+        for i in idxs:
+            if not self.queues[i] and i not in busy:
+                groups.setdefault(i % self.replicas, []).append(i)
+        sent = 0
+        for r, envs in groups.items():
+            if r in self._in_flight:
+                continue
+            self.clients[r].send({"cmd": "infer", "obs": [self._history(i) for i in envs]})
+            self._in_flight[r] = envs
+            self._sent_at[r] = time.time()
+            sent += len(envs)
+        return sent
 
-        def call(r: int, envs: list[int]):
-            rep = self.clients[r].call({"cmd": "infer", "obs": [self._history(i) for i in envs]})
-            return envs, np.asarray(rep["chunks"], dtype=np.float32)
-
-        if self._pool is not None and len(groups) > 1:
-            results = list(self._pool.map(lambda kv: call(*kv), groups.items()))
-        else:
-            results = [call(r, envs) for r, envs in groups.items()]
-        self.query_seconds += time.time() - t0
-        self.n_queries += len(need)
-        for envs, chunks in results:
+    def poll(self, block: bool = False) -> int:
+        """Collect finished replies (all in-flight ones if block). Returns #envs whose queue was filled."""
+        filled = 0
+        for r in list(self._in_flight):
+            if not block and not self.clients[r].ready():
+                continue
+            rep = self.clients[r].recv()
+            envs = self._in_flight.pop(r)
+            chunks = np.asarray(rep["chunks"], dtype=np.float32)
             for i, ch in zip(envs, chunks):
                 self.queues[i].extend(ch[: self.exec_steps])
+            self.query_seconds += time.time() - self._sent_at.pop(r)
+            self.n_queries += len(envs)
+            self.n_requests += 1
+            filled += len(envs)
+        return filled
+
+    def drain(self) -> None:
+        if self._in_flight:
+            self.poll(block=True)
+
+    def ensure(self, idxs) -> None:
+        """Synchronous: make sure every env in idxs has a queued action (drains in-flight requests first)."""
+        self.drain()
+        while any(not self.queues[i] for i in idxs):
+            self.submit(idxs)
+            self.poll(block=True)
 
     def peek(self, i: int) -> np.ndarray:
         return self.queues[i][0].copy()
