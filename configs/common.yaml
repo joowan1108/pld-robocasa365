@@ -71,6 +71,12 @@ stage1:
   # reuse_offline: true -> load it instead of collecting (timing.json then records the reuse + the source's
   # collection time). Off by default so Stage-1 wall-clock measurements include the collection.
   reuse_offline: false
+  # The state after Cal-QL + warm-up (critic + optimiser, actor, temperature, warm-up transitions, counters) is
+  # always saved to offline_cache/<key>/warmup_<hash>/; the hash covers everything it depends on except xi.
+  # reuse_warmup: true -> load it and go straight to online RL (timing.json records the source's Cal-QL and
+  # warm-up seconds). warmup_cache_actor: keep (identical to an uninterrupted run) | reset (fresh actor+temperature).
+  reuse_warmup: false
+  warmup_cache_actor: keep
   max_online_env_steps: 250000   # stored online transitions (paper: 250k online steps)
   max_wall_hours: 48
   sr_window: 100                 # Fig. 5 sliding window

@@ -15,12 +15,14 @@ Usage:
 from __future__ import annotations
 
 import collections
+import hashlib
 import itertools
 import json
 import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from .common import (build_backbone, build_env_and_base, build_specialists, common_argparser, learnable_stage_ids,
                      make_runner, sample_t_base, save_specialists, sync_collectors)
@@ -64,6 +66,62 @@ def save_offline_cache(cache: Path, specs: dict, meta: dict) -> None:
     print(f"[stage1] offline buffer saved to {cache}", flush=True)
 
 
+# Settings that do not change what Cal-QL + warm-up produce (or only marginally: xi enters the TD target through
+# pi_delta's action at s'). They are recorded in the warm-up cache but not part of its key, so e.g. a xi change
+# can reuse the critic and warm-up data.
+WARMUP_KEY_EXCLUDE_RL = {"device"}
+WARMUP_KEY_EXCLUDE_RES = {"xi", "xi_schedule", "xi_start", "xi_ramp_steps"}
+
+
+def warmup_meta(cfg: dict, offline_src: dict) -> dict:
+    """Everything the post-warm-up state (Cal-QL critic, warm-up transitions, learner state) depends on."""
+    return {
+        "offline_cache_created": offline_src.get("created"),  # a re-collected offline buffer invalidates it
+        "offline_key": {k: offline_src.get(k) for k in ("model", "task", "layout_id", "style_id", "n_successes",
+                                                         "base_model_path", "fmap_shape", "n_cams")},
+        "rl": {k: v for k, v in cfg["rl"].items() if k not in WARMUP_KEY_EXCLUDE_RL},
+        "residual": {k: v for k, v in cfg["residual"].items() if k not in WARMUP_KEY_EXCLUDE_RES},
+        "warmup_seed_base": int(cfg["seeds"]["warmup"]),
+        "stage_ids": sorted(int(k) for k in learnable_stage_ids(cfg)),
+    }
+
+
+def warmup_cache_dir(offline_cache: Path, meta: dict) -> Path:
+    h = hashlib.sha1(json.dumps(meta, sort_keys=True, default=str).encode()).hexdigest()[:10]
+    return offline_cache / f"warmup_{h}"
+
+
+def save_warmup_cache(d: Path, specs: dict, meta: dict, records: list[dict], info: dict) -> None:
+    """Learners must be stopped. Saves per specialist: full agent state + optimisers, and the online buffer."""
+    d.mkdir(parents=True, exist_ok=True)
+    for k, sp in specs.items():
+        a = sp.agent
+        torch.save({"agent": a.state_dict(), "critic_opt": a.critic_opt.state_dict(),
+                    "actor_opt": a.actor_opt.state_dict(), "alpha_opt": a.alpha_opt.state_dict()},
+                   d / f"agent{k}.pt")
+        sp.online.save(d / f"online{k}.npz")
+    with open(d / "warmup_episodes.jsonl", "w") as f:
+        for r in records:
+            f.write(json.dumps(r, default=float) + "\n")
+    (d / "meta.json").write_text(json.dumps({**meta, **info}, indent=2, default=float))
+    print(f"[stage1] warm-up state saved to {d}", flush=True)
+
+
+def load_warmup_cache(d: Path, specs: dict, actor_mode: str) -> None:
+    for k, sp in specs.items():
+        a = sp.agent
+        ck = torch.load(d / f"agent{k}.pt", map_location=a.device, weights_only=False)
+        a.load_state_dict(ck["agent"])
+        a.critic_opt.load_state_dict(ck["critic_opt"])
+        if actor_mode == "keep":
+            a.actor_opt.load_state_dict(ck["actor_opt"])
+            a.alpha_opt.load_state_dict(ck["alpha_opt"])
+        else:  # "reset": fresh pi_delta + temperature (Alg. 1 initialisation) on top of the warmed-up critic
+            a.init_actor()
+        a.xi_steps = 0
+        sp.online.load(d / f"online{k}.npz")
+
+
 def main():
     ap = common_argparser("PLD stage 1: residual specialist training")
     ap.add_argument("--skip-final-eval", action="store_true")
@@ -93,11 +151,16 @@ def main():
     runner = make_runner(cfg, venv, base, backbone, specs, K)
     rng = np.random.default_rng(cfg["seeds"]["online"])
 
-    def log_episode(phase: str, r: EpisodeResult, **kw):
-        ep_log.log(phase=phase, seed=r.spec.seed, success=r.success, length=r.length, stage=r.stage_reached,
-                   t_base=r.spec.t_base, took_over=r.took_over, takeover_step=r.takeover_step,
-                   n_stored=r.n_stored, wall_s=r.wall_s, scene=r.extra.get("scene"),
-                   residual=r.extra.get("residual"), **kw)
+    def episode_record(phase: str, r: EpisodeResult, **kw) -> dict:
+        return dict(phase=phase, seed=r.spec.seed, success=r.success, length=r.length, stage=r.stage_reached,
+                    t_base=r.spec.t_base, took_over=r.took_over, takeover_step=r.takeover_step,
+                    n_stored=r.n_stored, wall_s=r.wall_s, scene=r.extra.get("scene"),
+                    residual=r.extra.get("residual"), **kw)
+
+    def log_episode(phase: str, r: EpisodeResult, **kw) -> dict:
+        rec = episode_record(phase, r, **kw)
+        ep_log.log(**rec)
+        return rec
 
     try:
         # ------------------------------------------------------------ offline successes
@@ -143,42 +206,81 @@ def main():
                                               "hardware": timer.data["hardware"], "created": time.time()})
             timer.set("offline_cache", str(cache))
 
-        # ------------------------------------------------------------ Cal-QL critic warm-start
-        with timer.phase("calql_pretrain"):
-            for k, sp in specs.items():
-                sp.agent.pretrain_calql(sp.offline, int(rl["calql"]["steps"]),
-                                        log_fn=lambda **kw: learn_log.log(phase="calql", stage=k, **kw))
-        sync_collectors(specs)
+        # Warm-up cache: the state after Cal-QL + warm-up (critic, warm-up transitions, learner state) is saved under
+        # the offline cache, keyed by everything it depends on except xi; stage1.reuse_warmup loads it.
+        off_src = json.loads((cache / "meta.json").read_text())
+        wmeta = warmup_meta(cfg, off_src)
+        wdir = warmup_cache_dir(cache, wmeta)
+        reuse_warm = bool(s1.get("reuse_warmup")) and (wdir / "meta.json").exists()
+        if s1.get("reuse_warmup") and not reuse_warm:
+            print(f"[stage1] no compatible warm-up cache ({wdir.name}); running Cal-QL + warm-up", flush=True)
 
-        # ------------------------------------------------------------ learners
-        for k, sp in specs.items():
-            sp.learner = AsyncLearner(sp.agent, sp.offline, sp.online, sp.collector_actor, sp.actor_lock,
-                                      log_fn=lambda k=k, **kw: learn_log.log(phase="online", stage=k, **kw))
-            sp.learner.start()
+        def start_learners():
+            for k, sp in specs.items():
+                sp.learner = AsyncLearner(sp.agent, sp.offline, sp.online, sp.collector_actor, sp.actor_lock,
+                                          log_fn=lambda k=k, **kw: learn_log.log(phase="online", stage=k, **kw))
+                sp.learner.start()
 
         def check():
             for sp in specs.values():
                 if sp.learner is not None and sp.learner.error is not None:
                     raise RuntimeError("learner thread died") from sp.learner.error
 
-        # ------------------------------------------------------------ warm-up (base-only, stored)
-        n_warm = int(rl["warmup_episodes"])
-        wseeds = itertools.count(cfg["seeds"]["warmup"])
-        wcount = {"n": 0, "issued": 0}
+        if reuse_warm:
+            wsrc = json.loads((wdir / "meta.json").read_text())
+            actor_mode = str(s1.get("warmup_cache_actor", "keep"))
+            with timer.phase("warmup_load"):
+                load_warmup_cache(wdir, specs, actor_mode)
+            for line in (wdir / "warmup_episodes.jsonl").read_text().splitlines():
+                ep_log.log(**{**json.loads(line), "from_cache": True})
+            timer.add_phase_seconds("calql_pretrain", float(wsrc["calql_seconds"]))
+            timer.add_phase_seconds("warmup", float(wsrc["warmup_seconds"]))
+            timer.set("warmup_is_from_cache", {"dir": str(wdir), "actor": actor_mode,
+                                               "source_run": wsrc.get("source_run"),
+                                               "xi_at_creation": wsrc.get("xi_at_creation")})
+            sync_collectors(specs)
+            start_learners()
+        else:
+            # -------------------------------------------------------- Cal-QL critic warm-start
+            with timer.phase("calql_pretrain"):
+                for k, sp in specs.items():
+                    sp.agent.pretrain_calql(sp.offline, int(rl["calql"]["steps"]),
+                                            log_fn=lambda **kw: learn_log.log(phase="calql", stage=k, **kw))
+            sync_collectors(specs)
+            start_learners()
 
-        def warm_spec():
-            if wcount["issued"] >= n_warm:
-                return None
-            wcount["issued"] += 1
-            return EpisodeSpec(seed=next(wseeds), mode="base", store="online")
+            # -------------------------------------------------------- warm-up (base-only, stored)
+            n_warm = int(rl["warmup_episodes"])
+            wseeds = itertools.count(cfg["seeds"]["warmup"])
+            wcount = {"n": 0, "issued": 0}
+            wrecords: list[dict] = []
 
-        def warm_end(r):
-            wcount["n"] += 1
-            log_episode("warmup", r)
-            return False
+            def warm_spec():
+                if wcount["issued"] >= n_warm:
+                    return None
+                wcount["issued"] += 1
+                return EpisodeSpec(seed=next(wseeds), mode="base", store="online")
 
-        with timer.phase("warmup"):
-            runner.run(warm_spec, warm_end, check)
+            def warm_end(r):
+                wcount["n"] += 1
+                wrecords.append(log_episode("warmup", r))
+                return False
+
+            with timer.phase("warmup"):
+                runner.run(warm_spec, warm_end, check)
+
+            # Save the post-warm-up state (learners paused so the snapshot is consistent), then resume.
+            for sp in specs.values():
+                sp.learner.stop()
+            save_warmup_cache(wdir, specs, wmeta, wrecords, {
+                "calql_seconds": timer.data["phases"]["calql_pretrain"]["seconds"],
+                "warmup_seconds": timer.data["phases"]["warmup"]["seconds"],
+                "xi_at_creation": {k: sp.agent.xi for k, sp in specs.items()},
+                "residual_full": cfg["residual"], "num_envs": venv.num_envs, "source_run": str(rd),
+                "created": time.time()})
+            timer.set("warmup_cache", str(wdir))
+            sync_collectors(specs)
+            start_learners()
 
         # ------------------------------------------------------------ online PLD training
         oseeds = itertools.count(cfg["seeds"]["online"])

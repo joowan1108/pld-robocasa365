@@ -104,3 +104,50 @@ def test_stage1_offline_buffer_saved_and_reused(patched, monkeypatch):
                                       "rl.discount=0.98"])
     with pytest.raises(RuntimeError, match="incompatible"):
         s1.main()
+
+
+def test_stage1_warmup_cache_saved_and_reused(patched, monkeypatch):
+    import pld_rc365.stage1_train as s1
+
+    runs = patched / "runs"
+    base = ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--skip-final-eval", "--set", *TINY,
+            f"paths.runs_root={runs}"]
+    monkeypatch.setattr(sys, "argv", base)
+    s1.main()
+    cache = runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / "L11_S34_n2"
+    wdirs = sorted(cache.glob("warmup_*"))
+    assert len(wdirs) == 1 and (wdirs[0] / "agent0.pt").exists() and (wdirs[0] / "online0.npz").exists()
+    wmeta = json.loads((wdirs[0] / "meta.json").read_text())
+    n_warm_eps = len((wdirs[0] / "warmup_episodes.jsonl").read_text().splitlines())
+    assert n_warm_eps == 2 and wmeta["calql_seconds"] >= 0 and wmeta["warmup_seconds"] > 0
+
+    rd = runs / "xr1" / "CoffeeSetupMug" / "stage1"
+    rd.rename(rd.with_name("stage1_first"))
+    # different xi -> same cache (xi is not part of the key); no Cal-QL / warm-up is run
+    monkeypatch.setattr(sys, "argv", base + ["stage1.reuse_offline=true", "stage1.reuse_warmup=true",
+                                             "residual.xi=0.05", "residual.xi_schedule=constant"])
+    called = {"calql": 0}
+    from pld_rc365.rl import agent as agent_mod
+    real = agent_mod.ResidualSAC.pretrain_calql
+
+    def spy(self, *a, **k):
+        called["calql"] += 1
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(agent_mod.ResidualSAC, "pretrain_calql", spy)
+    s1.main()
+    assert called["calql"] == 0
+    timing = json.loads((rd / "timing.json").read_text())
+    assert "warmup_load" in timing["phases"] and timing["extra"]["warmup_is_from_cache"]["actor"] == "keep"
+    assert timing["phases"]["warmup"]["seconds"] == pytest.approx(wmeta["warmup_seconds"])
+    eps = [json.loads(l) for l in (rd / "episodes.jsonl").read_text().splitlines()]
+    assert sum(e["phase"] == "warmup" and e.get("from_cache") for e in eps) == n_warm_eps
+    assert any(e["phase"] == "online" for e in eps)
+    assert sorted(cache.glob("warmup_*")) == wdirs          # nothing new written
+
+    # a change that matters (Cal-QL steps) -> different key -> recomputed and saved separately
+    rd.rename(rd.with_name("stage1_second"))
+    monkeypatch.setattr(sys, "argv", base + ["stage1.reuse_offline=true", "stage1.reuse_warmup=true",
+                                             "rl.calql.steps=4"])
+    s1.main()
+    assert called["calql"] == 1 and len(sorted(cache.glob("warmup_*"))) == 2
