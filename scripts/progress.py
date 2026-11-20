@@ -66,6 +66,19 @@ def main():
 
     base_eps = by.get("offline", []) + by.get("warmup", [])
     base_sr = mean(e["success"] for e in base_eps)
+    # Fair baseline for the takeover SR: residual takes over only in episodes still running at T_base, which are
+    # harder than average. Apply the same T_base distribution to the base-only episodes (length, success).
+    fair = None
+    alpha = float(json.loads((rd / "config.json").read_text())["probing"]["alpha"]) if (rd / "config.json").exists() else None
+    horizon = timing.get("extra", {}).get("horizon")
+    if base_eps and alpha is not None and horizon:
+        hi = int(alpha * horizon)
+        num = den = 0.0
+        for e in base_eps:
+            p_alive = min(1.0, max(0, min(e["length"], hi + 1)) / (hi + 1))   # P(T_base < length)
+            den += p_alive
+            num += p_alive * e["success"]
+        fair = num / den if den else None
     online = by.get("online", [])
     took = [e for e in online if e.get("took_over")]
     roll = online[-1]["rolling_sr"] if online else None
@@ -84,6 +97,8 @@ def main():
 
     if args.oneline:
         parts = [f"[{(now - t0) / 60:.0f}m] {phase}", f"base SR {base_sr:.2f} ({len(base_eps)} eps)" if base_sr is not None else "base SR -"]
+        if fair is not None:
+            parts.append(f"fair takeover baseline {fair:.2f}")
         if online:
             parts.append(f"online eps {len(online)} (takeover {len(took)})")
             parts.append(f"rolling SR {roll:.2f}" if roll is not None else "rolling SR -")
@@ -103,6 +118,9 @@ def main():
             o = timing["extra"]["offline"]
             print(f"offline      : {o['successes']}/{o['episodes']} successes, mean success length {o.get('mean_success_length')}")
         print(f"base SR      : {base_sr if base_sr is None else round(base_sr, 3)}  (offline + warm-up, base policy only, {len(base_eps)} eps)")
+        if fair is not None:
+            print(f"fair baseline: {fair:.3f}  (base-only SR among episodes still running at T_base ~ U[0, alpha*T]; "
+                  f"compare with the takeover rolling SR)")
         print(f"online       : {len(online)} episodes, {len(took)} with residual takeover; "
               f"rolling SR (last 100 takeover eps) = {roll}")
         print(f"online steps : {online_steps}")
