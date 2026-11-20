@@ -48,20 +48,24 @@ class ResidualSAC:
         self.online_steps = 0  # stored online transitions (budget)
         self.xi_steps = 0      # stored online transitions where the residual acted (drives the xi schedule;
                                # warm-up / base-only steps do not advance it)
-        self._arch = dict(fmap_shape=fmap_shape, n_cams=n_cams, proprio_dim=proprio_dim, base_dim=base_dim)
+        # Paper Eq. 2: critic Q(s, a_bar) -- a_b goes to the actor only. critic_uses_a_b=true gives Q(s, a_b, a_bar)
+        # (used by the first runs, before this was checked against the paper).
+        critic_base = base_dim if bool(rl.get("critic_uses_a_b", False)) else 0
+        self._arch = dict(fmap_shape=fmap_shape, n_cams=n_cams, proprio_dim=proprio_dim, base_dim=base_dim,
+                          critic_base_dim=critic_base)
         torch.manual_seed(seed)
         self.rng = np.random.default_rng(seed)
 
-        self.critic = Critic(self._make_encoder(), self.act_dim, rl["hidden_dim"], rl["num_q"]).to(self.device)
+        self.critic = Critic(self._make_encoder(critic_base), self.act_dim, rl["hidden_dim"], rl["num_q"]).to(self.device)
         self.critic_targ = copy.deepcopy(self.critic).requires_grad_(False)
         self.critic_opt = torch.optim.AdamW(self.critic.parameters(), lr=rl["lr"])
         self.init_actor()
         self.n_updates = 0
 
     # ------------------------------------------------------------------ construction
-    def _make_encoder(self) -> Encoder:
+    def _make_encoder(self, base_dim: int | None = None) -> Encoder:
         a = self._arch
-        return Encoder(a["n_cams"], a["fmap_shape"], a["proprio_dim"], a["base_dim"],
+        return Encoder(a["n_cams"], a["fmap_shape"], a["proprio_dim"], a["base_dim"] if base_dim is None else base_dim,
                        self.rl["latent_dim"], self.rl["num_spatial_features"])
 
     def init_actor(self):

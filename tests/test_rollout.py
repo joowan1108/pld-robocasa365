@@ -311,3 +311,19 @@ def test_episode_residual_summary_is_logged():
     assert r["steps"] == 8 and len(r["mean_abs"]) == 7 and r["xi"] == pytest.approx(0.5)
     assert all(0 <= v <= 0.5 + 1e-6 for v in r["mean_abs"]) and 0 <= r["abs_over_xi"] <= 1.0 + 1e-6
     assert res[1].extra["residual"] is None          # base-only episode: no residual acted
+
+
+def test_critic_input_follows_paper_eq2():
+    import torch
+    from pld_rc365.rl.agent import ResidualSAC
+    rl = {"discount": 0.99, "tau": 0.005, "batch_size": 4, "target_entropy_scale": 0.5, "hidden_dim": 16,
+          "latent_dim": 8, "num_spatial_features": 2, "num_q": 2, "lr": 3e-4, "init_temperature": 1.0}
+    res = {"dims": 7, "xi": 0.1, "xi_schedule": "constant"}
+    f, p = torch.randn(3, 2, 4, 2, 2), torch.randn(3, 16)
+    ag = ResidualSAC(rl, res, (4, 2, 2), 2, device="cpu")
+    assert ag.critic.encoder.base_action_dim == 0 and ag.actor.encoder.base_action_dim == 12
+    z1 = ag.critic.encoder(f, p, torch.zeros(3, 12))
+    z2 = ag.critic.encoder(f, p, torch.ones(3, 12))
+    assert torch.equal(z1, z2)                                   # Q does not depend on a_b, only on a_bar
+    ag2 = ResidualSAC({**rl, "critic_uses_a_b": True}, res, (4, 2, 2), 2, device="cpu")
+    assert ag2.critic.encoder.base_action_dim == 12

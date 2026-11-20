@@ -3,7 +3,8 @@
 * Frozen ImageNet-pretrained ResNet-10 backbone (timm `resnet10t`) -> (512, 4, 4) feature map per 128x128 camera.
   Features are computed once at collection time and stored in the replay buffer (backbone is frozen).
 * Trainable SpatialLearnedEmbeddings head per camera (SERL) -> latent 256, LayerNorm, Tanh.
-* Inputs besides images: proprio (16-D) and the base action a_b (12-D) -> pi_delta(.|s, a_b), Q(s, a_b, a_bar).
+* Inputs besides images: proprio (16-D); the actor also gets the base action a_b (12-D): pi_delta(.|s, a_b).
+  The critic is Q(s, a_bar) as in the paper's Eq. 2 (no a_b input) unless rl.critic_uses_a_b is set.
 * 3-layer MLPs, hidden 256, LayerNorm + Tanh. Gaussian actor with tanh squashing, scaled to [-xi, xi].
 * Clipped double Q (2 heads, shared encoder), LayerNorm.
 """
@@ -69,11 +70,13 @@ class Encoder(nn.Module):
             [SpatialLearnedEmbeddings(c, h, w, num_spatial_features, latent) for _ in range(n_cams)]
         )
         self.proprio = nn.Sequential(nn.Linear(proprio_dim, 64), nn.LayerNorm(64), nn.Tanh())
-        self.out_dim = n_cams * latent + 64 + base_action_dim
+        self.base_action_dim = int(base_action_dim)  # 0 -> a_base is ignored (paper's critic Q(s, a_bar))
+        self.out_dim = n_cams * latent + 64 + self.base_action_dim
 
-    def forward(self, feats: torch.Tensor, proprio: torch.Tensor, a_base: torch.Tensor) -> torch.Tensor:
+    def forward(self, feats: torch.Tensor, proprio: torch.Tensor, a_base: torch.Tensor | None) -> torch.Tensor:
         zs = [head(feats[:, i]) for i, head in enumerate(self.heads)]
-        return torch.cat(zs + [self.proprio(proprio), a_base], dim=-1)
+        extra = [a_base] if self.base_action_dim else []
+        return torch.cat(zs + [self.proprio(proprio)] + extra, dim=-1)
 
 
 def mlp(inp: int, hidden: int, out: int, n_hidden: int = 3, act=nn.Tanh) -> nn.Sequential:

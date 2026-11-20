@@ -52,6 +52,8 @@ rl:                          # Table 5
   hidden_dim: 256
   latent_dim: 256
   num_spatial_features: 8    # SERL SpatialLearnedEmbeddings
+  critic_uses_a_b: false     # paper Eq. 2: critic Q(s, a_bar), a_b is an input of the actor only. true = Q(s, a_b, a_bar)
+                             # (the first three XR1 runs; must be true to load their checkpoints)
   backup_entropy: false      # SERL default
   utd: 1.0                   # critic updates per stored online transition (async learner throttle)
   actor_sync_every: 50       # learner steps between actor weight pushes to the collector
