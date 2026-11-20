@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from .base.client import BasePolicy
-from .envs.rc365_env import VecEnv
+from .envs.rc365_env import VecEnv, threshold_discrete
 from .rl.buffers import ReplayBuffer, segment_mc_returns
 
 
@@ -98,6 +98,7 @@ class Runner:
         self.offline_quota: int | None = None   # max successful episodes pushed to offline buffers
         self.offline_accepted = 0
         self.abort_on_stop = True               # drop in-flight episodes once on_end requested a stop
+        self.check_consistency = True           # cheap per-step invariants (bug guard, no effect on results)
 
     # ------------------------------------------------------------------ helpers
     def _features(self, pkts: list[dict]) -> np.ndarray:
@@ -226,7 +227,9 @@ class Runner:
             out = self.venv.step(actions)
             self.stats["env_steps"] += len(active)
             for i in active:
-                self.base.pop(i)
+                popped = self.base.pop(i)
+                if self.check_consistency:
+                    self._check_step(i, popped, a_b[i], actions[i], a_bar[i], out[i])
                 self.base.observe(i, out[i])
             # 6. next-state features for transitions being stored
             nf_idx = [i for i in active if stores[i]]
@@ -279,6 +282,22 @@ class Runner:
                     if states[i].spec.record:
                         self.venv.finish(i, False)
                     states.pop(i)
+
+    def _check_step(self, i, popped, a_b, action, a_bar, pkt):
+        """Invariants between what was stored and what was executed (raise on the first violation):
+        chunk pointer: the base action used at this step is the queue element consumed for it;
+        stored a_bar equals the executed arm+gripper action; base/torso/mode pass through from the VLA;
+        the env executed exactly the thresholded version of the action we sent."""
+        d = self.d
+        if not np.array_equal(np.asarray(popped), a_b):
+            raise RuntimeError(f"env {i}: chunk desync, used a_b {a_b} but queue popped {popped}")
+        if not np.allclose(action[:d], a_bar, atol=1e-6):
+            raise RuntimeError(f"env {i}: stored a_bar {a_bar} != executed arm action {action[:d]}")
+        if not np.array_equal(action[d:], a_b[d:]):
+            raise RuntimeError(f"env {i}: base/torso/mode dims changed: {action[d:]} vs a_b {a_b[d:]}")
+        ex = pkt.get("executed_action")
+        if ex is not None and not np.allclose(ex, threshold_discrete(action), atol=1e-6):
+            raise RuntimeError(f"env {i}: env executed {ex} but we sent {action}")
 
     # stage-2 hooks (overridden via attributes)
     keep_pure_base: bool = True

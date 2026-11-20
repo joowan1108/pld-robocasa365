@@ -45,7 +45,7 @@ EOF
 ( cd "$REPO" && "$XR1" -c "import peft, av, zmq, pld_rc365.sft.xr1_lora_train; print('[ok] xr1 env')" )
 ( cd "$REPO" && "$RLDX" -c "import zmq, rldx; print('[ok] rldx env')" )
 
-echo "[i] host memory limit (cgroup): $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)  -- ~6.5 GB per env + replay buffer"
+echo "[i] memory limit (cgroup): $(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo n/a) bytes -- ~6.5 GB per env + replay buffer"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 for d in Xiaomi-Robotics-1-RoboCasa365 RLDX-1-FT-RC365; do
   [[ -f $CK/$d/config.json ]] && echo "[ok] checkpoint $d" || echo "[..] checkpoint $d not there yet (tail -f /workspace/download.log)"

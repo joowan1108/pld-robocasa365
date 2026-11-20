@@ -208,3 +208,19 @@ def test_linear_xi_schedule_counts_residual_steps_only_and_persists():
     agent2 = ResidualSAC(RL, res, FMAP, 2, device="cpu", seed=1)
     agent2.load_state_dict(agent.state_dict())
     assert agent2.xi == pytest.approx(0.5)      # stage 2 continues at the final xi
+
+
+def test_consistency_check_catches_chunk_desync():
+    runner, venv, base, specs = make_runner(num_envs=1, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    orig_pop = base.pop
+    calls = {"n": 0}
+
+    def bad_pop(i):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            orig_pop(i)           # pointer advanced between peek and pop: the consumed element is not the used one
+        return orig_pop(i)
+
+    base.pop = bad_pop
+    with pytest.raises(RuntimeError, match="chunk desync"):
+        run_n(runner, [EpisodeSpec(seed=1, mode="pld", t_base=2, store="online")], 1)

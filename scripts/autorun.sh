@@ -19,7 +19,7 @@ ldconfig -p | grep -q libEGL_nvidia || fail "libEGL_nvidia missing: template nee
 for u in https://github.com https://huggingface.co; do
   curl -sSfI --max-time 20 "$u" > /dev/null || echo "[!] cannot reach $u (downloads may fail)"
 done
-echo "[i] cgroup memory limit: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)"
+echo "[i] cgroup memory limit: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo n/a)"
 
 say "downloads (background, log /workspace/download.log)"
 if [[ ! -f /workspace/.download/assets.done || ! -f /workspace/.download/$MODEL.done ]]; then

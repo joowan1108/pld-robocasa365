@@ -28,11 +28,13 @@ if [[ $MODEL == rldx ]]; then ENVS_PER_GPU="${ENVS_PER_GPU:-3}"; else ENVS_PER_G
 MEM_GB=$("$PY" - <<'PYMEM'
 import os
 lim = None
-try:
-    v = open("/sys/fs/cgroup/memory.max").read().strip()
-    lim = None if v == "max" else int(v)
-except Exception:
-    pass
+for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):  # cgroup v2 / v1
+    try:
+        v = open(f).read().strip()
+        lim = None if v == "max" else int(v)
+        break
+    except Exception:
+        pass
 tot = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
 print(int(min(lim or tot, tot) / 2**30))
 PYMEM
