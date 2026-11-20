@@ -43,7 +43,8 @@ def main():
     ep_log = JsonlLogger(rd / "episodes.jsonl")
 
     spec_path = Path(args.specialists) if args.specialists else run_dir(cfg, "stage1") / "specialists_final.pt"
-    venv, base, spec = build_env_and_base(cfg, record_root=str(raw_root))
+    venv, base, spec = build_env_and_base(cfg, record_root=str(raw_root), training=True)
+    timer.set("num_envs_actual", venv.num_envs)
     horizon = venv.horizon
     backbone, fmap_shape, n_cams = build_backbone(cfg)
     specs = load_specialists(cfg, spec_path, fmap_shape, n_cams)

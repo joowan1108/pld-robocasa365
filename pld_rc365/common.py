@@ -30,14 +30,47 @@ def sample_t_base(cfg: dict, horizon: int, rng: np.random.Generator) -> int:
     return int(rng.integers(0, hi + 1))
 
 
+def _free_gpu_gb(index: int) -> float | None:
+    """Free memory on a GPU via nvidia-smi (no CUDA context is created in this process)."""
+    import subprocess
+
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits", "-i", str(index)],
+                             capture_output=True, text=True, timeout=20).stdout.strip()
+        return float(out.splitlines()[0]) / 1024.0
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def cap_num_envs(cfg: dict, n: int, training: bool) -> int:
+    e = cfg["env"]
+    if not e.get("cap_envs_by_gpu_mem", False):
+        return n
+    devs = [int(x) for x in os.environ.get("PLD_EGL_DEVICES", "0").split(",") if x != ""] or [0]
+    free = [_free_gpu_gb(d) for d in devs]
+    if any(f is None for f in free):
+        return n
+    reserve = float(e.get("gpu_mem_reserve_train_gb" if training else "gpu_mem_reserve_eval_gb", 1.0))
+    per = float(e.get("gpu_mem_per_env_gb", 1.2))
+    # envs are spread round-robin over the rendering GPUs; the learner lives on the last one
+    allowed = sum(max(0, int((f - (reserve if k == len(free) - 1 else 0.0)) // per)) for k, f in enumerate(free))
+    if allowed < n:
+        print(f"[envs] capping num_envs {n} -> {max(1, allowed)} (free GPU GB {['%.1f' % f for f in free]}, "
+              f"{per} GB/env, reserve {reserve} GB)", flush=True)
+        return max(1, allowed)
+    return n
+
+
 def build_env_and_base(cfg: dict, scene: str = "fixed", task: str | None = None, record_root: str | None = None,
-                       num_envs: int | None = None, port: int | None = None, host: str | None = None):
+                       num_envs: int | None = None, port: int | None = None, host: str | None = None,
+                       training: bool = False):
     from .utils.threads import limit_threads
 
     limit_threads()
     os.environ.setdefault("MUJOCO_GL", cfg["env"].get("mujoco_gl", "egl"))
     spec = make_spec(cfg, scene=scene, task=task)
-    n = int(num_envs or cfg["env"]["num_envs"])
+    n = cap_num_envs(cfg, int(num_envs or cfg["env"]["num_envs"]), training)
+    cfg["env"]["num_envs_actual"] = n
     egl = os.environ.get("PLD_EGL_DEVICES")
     venv = VecEnv(spec, n, record_root=record_root, gl=cfg["env"].get("mujoco_gl", "egl"),
                   egl_devices=egl.split(",") if egl else None)

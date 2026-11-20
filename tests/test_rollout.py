@@ -239,3 +239,19 @@ def test_consistency_check_allows_out_of_range_base_actions():
     base.ensure = ensure
     for mode, tb in (("base", 0), ("pld", 3)):
         run_n(runner, [EpisodeSpec(seed=1, mode=mode, t_base=tb, store="online")], 1)
+
+
+def test_cap_num_envs_by_free_gpu_memory(monkeypatch):
+    from pld_rc365 import common
+
+    cfg = {"env": {"cap_envs_by_gpu_mem": True, "gpu_mem_per_env_gb": 1.2, "gpu_mem_reserve_train_gb": 2.0,
+                   "gpu_mem_reserve_eval_gb": 0.5}}
+    monkeypatch.delenv("PLD_EGL_DEVICES", raising=False)
+    monkeypatch.setattr(common, "_free_gpu_gb", lambda i: 12.6)       # 4090 with the XR1 server loaded
+    assert common.cap_num_envs(cfg, 10, training=True) == 8
+    assert common.cap_num_envs(cfg, 10, training=False) == 10
+    monkeypatch.setenv("PLD_EGL_DEVICES", "0,1")
+    monkeypatch.setattr(common, "_free_gpu_gb", lambda i: 12.6 if i == 0 else 10.0)
+    assert common.cap_num_envs(cfg, 20, training=True) == 10 + 6
+    monkeypatch.setattr(common, "_free_gpu_gb", lambda i: None)       # no nvidia-smi: leave as is
+    assert common.cap_num_envs(cfg, 10, training=True) == 10

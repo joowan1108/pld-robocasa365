@@ -20,7 +20,8 @@ TINY = [
 
 @pytest.fixture
 def patched(monkeypatch, tmp_path):
-    def fake_build_env_and_base(cfg, scene="fixed", task=None, record_root=None, num_envs=None, port=None, host=None):
+    def fake_build_env_and_base(cfg, scene="fixed", task=None, record_root=None, num_envs=None, port=None, host=None,
+                                training=False):
         n = int(num_envs or cfg["env"]["num_envs"])
         venv = FakeVecEnv(n, horizon=12, stage_steps=(5,))
         venv.close = lambda: None

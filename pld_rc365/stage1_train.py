@@ -43,7 +43,8 @@ def main():
     learn_log = JsonlLogger(rd / "learner.jsonl")
     s1, rl = cfg["stage1"], cfg["rl"]
 
-    venv, base, spec = build_env_and_base(cfg)
+    venv, base, spec = build_env_and_base(cfg, training=True)
+    timer.set("num_envs_actual", venv.num_envs)
     horizon = venv.horizon
     K = len(spec.stage_names)
     timer.set("horizon", horizon)
