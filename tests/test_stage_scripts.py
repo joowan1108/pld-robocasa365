@@ -79,7 +79,7 @@ def test_stage1_offline_buffer_saved_and_reused(patched, monkeypatch):
               f"paths.runs_root={runs}"]
     monkeypatch.setattr(sys, "argv", ["stage1", *common])
     s1.main()
-    cache = runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / "L11_S34_n2"
+    cache = runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / "L11_S34_n2_e16"
     meta = json.loads((cache / "meta.json").read_text())
     assert (cache / "stage0.npz").exists() and meta["stats"]["successes"] == 2 and meta["gamma"] == 0.99
     first = json.loads((runs / "xr1" / "CoffeeSetupMug" / "stage1" / "timing.json").read_text())
@@ -114,7 +114,7 @@ def test_stage1_warmup_cache_saved_and_reused(patched, monkeypatch):
             f"paths.runs_root={runs}"]
     monkeypatch.setattr(sys, "argv", base)
     s1.main()
-    cache = runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / "L11_S34_n2"
+    cache = runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / "L11_S34_n2_e16"
     wdirs = sorted(cache.glob("warmup_*"))
     assert len(wdirs) == 1 and (wdirs[0] / "agent0.pt").exists() and (wdirs[0] / "online0.npz").exists()
     wmeta = json.loads((wdirs[0] / "meta.json").read_text())
@@ -168,3 +168,18 @@ def test_stage1_limits_can_be_changed_while_running(patched, monkeypatch):
     assert timing["extra"]["online"]["stop_reason"] == "max_online_env_steps"        # not rolling_sr (stop_sr=2.0)
     assert timing["extra"]["limits_override"]["max_online_env_steps"] == 60
     assert 60 <= timing["extra"]["online"]["online_steps"]["0"] < 200
+
+
+def test_offline_cache_is_keyed_by_exec_steps(patched, monkeypatch):
+    import pld_rc365.stage1_train as s1
+
+    runs = patched / "runs"
+    for ex in (16, 4):
+        monkeypatch.setattr(sys, "argv", ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--skip-final-eval",
+                                          "--set", *TINY, f"paths.runs_root={runs}", f"base.exec_steps={ex}",
+                                          "stage1.reuse_offline=true"])
+        s1.main()
+        rd = runs / "xr1" / "CoffeeSetupMug" / "stage1"
+        rd.rename(rd.with_name(f"stage1_e{ex}"))
+    caches = sorted(p.name for p in (runs / "xr1" / "CoffeeSetupMug" / "offline_cache").iterdir())
+    assert caches == ["L11_S34_n2_e16", "L11_S34_n2_e4"]      # separate buffers, nothing overwritten

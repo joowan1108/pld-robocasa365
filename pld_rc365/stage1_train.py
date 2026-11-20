@@ -35,7 +35,9 @@ from .utils.timing import JsonlLogger, Timer
 def offline_cache_dir(cfg: dict, spec, n_off: int) -> Path:
     root = Path(cfg["paths"]["runs_root"])
     root = root if root.is_absolute() else REPO_ROOT / root
-    key = f"L{spec.layout_id}_S{spec.style_id}_n{n_off}"
+    # exec_steps (how many actions of each VLA chunk are executed before re-planning) changes the base policy's
+    # behaviour, so it is part of the key: runs with a different value never overwrite each other's buffers.
+    key = f"L{spec.layout_id}_S{spec.style_id}_n{n_off}_e{int(cfg['base']['exec_steps'])}"
     return root / cfg["model_name"] / cfg["task_name"] / "offline_cache" / key
 
 

@@ -43,7 +43,9 @@ def main():
     run = REPO / "runs" / args.model / args.task
     ck = Path(args.ckpt) if args.ckpt not in ("latest", "final") else run / "stage1" / f"specialists_{args.ckpt}.pt"
     sd = torch.load(ck, map_location="cpu", weights_only=False)
-    cache = sorted((run / "offline_cache").glob("*/meta.json"))[0].parent
+    metas = sorted((run / "offline_cache").glob("*/meta.json"))
+    same = [m for m in metas if json.loads(m.read_text()).get("exec_steps") == int(cfg["base"]["exec_steps"])]
+    cache = (same or metas)[0].parent
     meta = json.loads((cache / "meta.json").read_text())
     fmap, n_cams = tuple(meta["fmap_shape"]), int(meta["n_cams"])
     out = {"ckpt": str(ck), "extra": sd.get("extra", {})}

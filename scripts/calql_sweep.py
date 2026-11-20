@@ -68,6 +68,7 @@ def main():
         cache = Path(args.cache)
     else:
         cands = sorted((root / args.model / args.task / "offline_cache").glob("*/meta.json"))
+        cands = [c for c in cands if json.loads(c.read_text()).get("exec_steps") == int(cfg["base"]["exec_steps"])] or cands
         assert len(cands) == 1, f"expected exactly one offline cache, found {cands}"
         cache = cands[0].parent
     meta = json.loads((cache / "meta.json").read_text())
