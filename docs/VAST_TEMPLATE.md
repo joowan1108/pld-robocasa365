@@ -65,8 +65,9 @@ nohup bash scripts/autorun.sh >> /workspace/autorun.log 2>&1 &
 
 ## 3. 대여 조건
 
-- **RTX 4090 ×2**. 1장도 동작합니다. 이미지가 40 시리즈 기준이라 5090은 쓰지 않습니다.
-- RAM 64GB 이상: env 하나에 ~6.5GB × 4개, 여기에 replay buffer 최대 ~16GB가 더해집니다.
+- **RTX 4090 ×1 또는 ×2**. 이미지가 40 시리즈 기준이라 5090은 쓰지 않습니다.
+- 2장이면 GPU마다 VLA 서버를 하나씩 띄워 Stage 1·2 처리량이 약 2배가 됩니다. 그러려면 env 8개를 돌릴 RAM 96GB 이상, vCPU 16 이상이 필요합니다.
+- RAM: env 하나에 ~6.5GB, 여기에 replay buffer 최대 ~16GB가 더해집니다. env 수는 RAM을 보고 자동으로 정해집니다.
 - vCPU 16 이상, 디스크 150GB, 다운로드 500Mbps 이상, Reliability 99% 이상.
 - 중국 지역은 제외합니다(HF, Docker Hub 접속 문제).
 - 같은 가격이면 네트워크 속도, 신뢰도, 대여 가능 기간을 우선합니다.

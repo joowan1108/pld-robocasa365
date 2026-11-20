@@ -38,7 +38,8 @@ def main():
     s2 = cfg["stage2"]
     raw_root = rd / "raw"
     timer = Timer(rd / "timing.json", extra={"model": args.model, "task": args.task,
-                                              "num_envs": int(cfg["env"]["num_envs"])})
+                                              "num_envs": int(cfg["env"]["num_envs"]),
+                                              "base_replicas": int(cfg["base"].get("replicas", 1))})
     ep_log = JsonlLogger(rd / "episodes.jsonl")
 
     spec_path = Path(args.specialists) if args.specialists else run_dir(cfg, "stage1") / "specialists_final.pt"

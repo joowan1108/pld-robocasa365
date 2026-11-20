@@ -115,9 +115,9 @@ on the lab PC.
 * **What the image provides:** the three Python envs under `/opt`.
 * **What the On-start script does:** downloads the RoboCasa assets and both checkpoints into
   `/workspace/checkpoints`.
-* **Which GPU to rent:** **2× RTX 4090** (1× also works). The image's torch builds target 40-series; a 5090
-  would need cu128 reinstalls. With 2 GPUs `run_experiment1.sh` puts the VLA server on GPU0, env rendering + the
-  residual learner on GPU1, and runs SFT with DDP on both.
+* **Which GPU to rent:** RTX 4090, 1× or 2×. The image's torch builds target 40-series; a 5090 would need cu128
+  reinstalls. With 2 GPUs, `run_experiment1.sh` runs one VLA server per GPU, which roughly doubles Stage 1/2
+  rollout throughput when there is enough RAM and CPU for 8 envs. It also runs SFT with DDP on both GPUs.
 * **Instance size:** ≥ 64 GB RAM, ≥ 16 vCPU, 150 GB disk, outside China. Right after renting, check:
   * `curl -I https://github.com` and `curl -I https://huggingface.co`
   * `cat /sys/fs/cgroup/memory.max`
@@ -152,9 +152,14 @@ Operating rules (learned on the DSRL runs):
 
 | | 1 GPU | 2 GPUs |
 |---|---|---|
-| Base-policy server | `CUDA_VISIBLE_DEVICES=0` | `CUDA_VISIBLE_DEVICES=0` |
-| PLD process (env rendering + residual learner) | `--set rl.device=cuda:0`, `PLD_EGL_DEVICES=0` | `--set rl.device=cuda:1`, `PLD_EGL_DEVICES=1` |
-| SFT (stop the server first) | `NPROC=1` | `NPROC=2` (DDP, full model copy per GPU) |
+| Base-policy servers (Stage 1/2, eval) | 1 replica on GPU0 | **1 replica per GPU** (ports 22000/22001 for XR1). Env *i* is served by replica *i* % 2 and both are queried concurrently, so base-policy throughput is ~2× |
+| Envs + rendering | 4 envs on GPU0 | up to 4 per GPU (RLDX: 3), capped by host RAM (~6.5 GB/env); rendering spread over both GPUs |
+| Residual learner | GPU0 | GPU1 |
+| SFT (servers stopped) | 1 GPU | DDP on both |
+
+`run_experiment1.sh` sets all of this from `nvidia-smi` and the cgroup memory limit. You can override it with
+`GPUS`, `REPLICAS`, `NUM_ENVS`, `ENVS_PER_GPU`. Stage 1/2 only speed up if there are enough CPU cores and RAM
+for the extra envs, because the physics runs on CPU. With 2× 4090, rent ≥ 96 GB RAM and ≥ 16 vCPU for 8 envs.
 
 Approximate GPU memory:
 

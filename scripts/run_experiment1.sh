@@ -6,7 +6,8 @@
 #
 # Unattended and resumable: every step is skipped if its result file already exists, and the script stops at the
 # first step that fails to produce its result. The base-policy server is started/stopped here (never alongside SFT).
-#   source vast.env && bash scripts/run_experiment1.sh     # GPU count auto-detected (1 or 2x RTX 4090)
+#   source vast.env && bash scripts/run_experiment1.sh     # GPU count / env count auto-detected
+# Overrides: GPUS, REPLICAS, NUM_ENVS, ENVS_PER_GPU, PLD_SET="a.b=c ...", PLD_EGL_DEVICES
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"
 MODEL="${MODEL:-xr1}"
@@ -18,14 +19,31 @@ SFT_BS="${SFT_BS:-32}"
 PER_DEV="${PER_DEV:-2}"          # 24 GB: try 2, fall back to 1 if XR1 SFT OOMs (or rent a 48 GB card for SFT)
 ATTN="${ATTN:-flash_attention_2}"
 PY="${PLD_SIM_PY:-python}"
-# GPU layout: GPU0 = VLA server. With 2 GPUs the env rendering + residual learner move to GPU1 (no memory
-# sharing with the server during rollouts); SFT runs DDP on both after the server is stopped.
-if (( GPUS >= 2 )); then
-  export PLD_EGL_DEVICES="${PLD_EGL_DEVICES:-1}"
-  DEFAULT_SET="rl.device=cuda:1"
-else
-  DEFAULT_SET=""
-fi
+# GPU layout. Stage 1/2 + eval: one base-policy server replica per GPU (env i -> replica i % GPUS, queried
+# concurrently), env rendering spread over all GPUs, residual learner on the last GPU. SFT: DDP over all GPUs
+# after the servers are stopped. Env count: up to ENVS_PER_GPU per replica, capped by host RAM (~6.5 GB per
+# RoboCasa env + ~20 GB for the replay buffer and processes).
+REPLICAS="${REPLICAS:-$GPUS}"; (( REPLICAS >= 1 )) || REPLICAS=1
+if [[ $MODEL == rldx ]]; then ENVS_PER_GPU="${ENVS_PER_GPU:-3}"; else ENVS_PER_GPU="${ENVS_PER_GPU:-4}"; fi
+MEM_GB=$("$PY" - <<'PYMEM'
+import os
+lim = None
+try:
+    v = open("/sys/fs/cgroup/memory.max").read().strip()
+    lim = None if v == "max" else int(v)
+except Exception:
+    pass
+tot = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+print(int(min(lim or tot, tot) / 2**30))
+PYMEM
+)
+RAM_ENVS=$(( (MEM_GB - 20) * 10 / 65 )); (( RAM_ENVS >= 1 )) || RAM_ENVS=1
+NUM_ENVS="${NUM_ENVS:-$(( ENVS_PER_GPU * REPLICAS < RAM_ENVS ? ENVS_PER_GPU * REPLICAS : RAM_ENVS ))}"
+export PLD_EGL_DEVICES="${PLD_EGL_DEVICES:-$(seq -s, 0 $((GPUS > 0 ? GPUS - 1 : 0)))}"
+DEFAULT_SET="base.replicas=$REPLICAS env.num_envs=$NUM_ENVS rl.device=cuda:$((GPUS > 0 ? GPUS - 1 : 0))"
+start_servers() {  # $1 = model path
+  for ((r = 0; r < REPLICAS; r++)); do bash scripts/server.sh start "$MODEL" "$1" "$((r % (GPUS > 0 ? GPUS : 1)))" "$r"; done
+}
 SET=(--set ${PLD_SET:-$DEFAULT_SET})
 TAG="sft1_pld${N}"
 R="runs/$MODEL/$TASK"
@@ -35,11 +53,11 @@ SFT_DIR="runs/$MODEL/_sft/pld${N}_${TASK}"
 
 need() { [[ -e $1 ]] || { echo "[x] step did not produce $1 -- stopping"; exit 1; }; }
 step() { echo; echo "=== $(date '+%F %T') $*"; }
-echo "[i] $MODEL x $TASK, GPUs=$GPUS, PLD overrides: ${SET[*]}, EGL devices: ${PLD_EGL_DEVICES:-default}"
+echo "[i] $MODEL x $TASK | GPUs=$GPUS replicas=$REPLICAS envs=$NUM_ENVS (host RAM ${MEM_GB} GB) | overrides: ${SET[*]} | EGL: $PLD_EGL_DEVICES"
 
 if [[ ! -f $R/eval/base.json || ! -f $R/eval/base_other.json || ! -f $R/stage1/specialists_final.pt \
       || ! -f runs/pld_data/$MODEL/${TASK}_pld${N}/lerobot/meta/info.json ]]; then
-  step "start $MODEL base server"; bash scripts/server.sh start "$MODEL" "$BASE_MODEL" 0
+  step "start $MODEL base server x$REPLICAS"; start_servers "$BASE_MODEL"
 fi
 if [[ ! -f $R/eval/base.json ]]; then
   step "base eval (fixed/pretrain/target)"; "$PY" -m pld_rc365.eval --model "$MODEL" --task "$TASK" --tag base "${SET[@]}"
@@ -76,7 +94,7 @@ SERVE="$("$PY" -c "import json;print(json.load(open('$SFT_DIR/timing.json'))['ex
 need "$SERVE"
 
 if [[ ! -f $R/eval/$TAG.json || ! -f $R/eval/${TAG}_other.json ]]; then
-  step "start $MODEL server with SFT checkpoint"; bash scripts/server.sh start "$MODEL" "$SERVE" 0
+  step "start $MODEL server x$REPLICAS with SFT checkpoint"; start_servers "$SERVE"
   [[ -f $R/eval/$TAG.json ]] || "$PY" -m pld_rc365.eval --model "$MODEL" --task "$TASK" --tag "$TAG" "${SET[@]}"
   [[ -f $R/eval/${TAG}_other.json ]] || "$PY" -m pld_rc365.eval --model "$MODEL" --task "$TASK" --tag "$TAG" --other-tasks "${SET[@]}"
   bash scripts/server.sh stop "$MODEL"

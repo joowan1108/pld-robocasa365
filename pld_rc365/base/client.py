@@ -3,12 +3,16 @@
 Chunk handling (not specified in the paper): the VLA is queried when the env's queue is empty, the first
 `exec_steps` actions of its 16-step chunk are queued (RLDX 8, XR1 16 -- their RC365 eval settings), and the
 residual acts per env step on the current queue head a_b,t.
+
+Replicas: with N servers (one per GPU, ports port..port+N-1) env i is served by replica i % N and the replicas
+are queried concurrently, so N GPUs give ~N x base-policy throughput (XR1 serves envs one by one).
 """
 
 from __future__ import annotations
 
 import collections
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -18,9 +22,13 @@ CAMS = ("robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand")
 
 
 class BasePolicy:
-    def __init__(self, host: str, port: int, num_envs: int, exec_steps: int, history_indices=(-6, -4, -2, 0)):
-        self.client = Client(host, port)
-        self.info = self.client.call({"cmd": "info"})
+    def __init__(self, host: str, port: int, num_envs: int, exec_steps: int, history_indices=(-6, -4, -2, 0),
+                 replicas: int = 1):
+        self.replicas = max(1, int(replicas))
+        self.clients = [Client(host, port + r) for r in range(self.replicas)]
+        infos = [c.call({"cmd": "info"}) for c in self.clients]
+        self.info = {**infos[0], "replicas": infos}
+        self._pool = ThreadPoolExecutor(max_workers=self.replicas) if self.replicas > 1 else None
         self.exec_steps = int(exec_steps)
         self.hist_idx = list(history_indices)
         self.maxlen = 1 - min(self.hist_idx)
@@ -60,12 +68,23 @@ class BasePolicy:
         if not need:
             return
         t0 = time.time()
-        rep = self.client.call({"cmd": "infer", "obs": [self._history(i) for i in need]})
+        groups: dict[int, list[int]] = {}
+        for i in need:
+            groups.setdefault(i % self.replicas, []).append(i)
+
+        def call(r: int, envs: list[int]):
+            rep = self.clients[r].call({"cmd": "infer", "obs": [self._history(i) for i in envs]})
+            return envs, np.asarray(rep["chunks"], dtype=np.float32)
+
+        if self._pool is not None and len(groups) > 1:
+            results = list(self._pool.map(lambda kv: call(*kv), groups.items()))
+        else:
+            results = [call(r, envs) for r, envs in groups.items()]
         self.query_seconds += time.time() - t0
         self.n_queries += len(need)
-        chunks = np.asarray(rep["chunks"], dtype=np.float32)
-        for i, ch in zip(need, chunks):
-            self.queues[i].extend(ch[: self.exec_steps])
+        for envs, chunks in results:
+            for i, ch in zip(envs, chunks):
+                self.queues[i].extend(ch[: self.exec_steps])
 
     def peek(self, i: int) -> np.ndarray:
         return self.queues[i][0].copy()

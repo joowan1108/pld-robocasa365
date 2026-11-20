@@ -5,6 +5,7 @@ base:
   port: 22000
   exec_steps: 16           # XR1 RC365 eval: replan every 16 steps
   chunk_len: 16
+  replicas: 1              # number of servers (one per GPU) on ports port..port+replicas-1
   history_indices: [-6, -4, -2, 0]   # obs_history=4, obs_interval=2
   crop_ratio: 0.95
   num_steps: 5

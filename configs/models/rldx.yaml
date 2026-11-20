@@ -5,4 +5,5 @@ base:
   port: 21000
   exec_steps: 8            # RLDX RC365 eval: n_action_steps=8 of the 16-step chunk
   chunk_len: 16
+  replicas: 1              # number of servers (one per GPU) on ports port..port+replicas-1
   history_indices: [-6, -4, -2, 0]

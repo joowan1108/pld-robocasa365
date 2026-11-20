@@ -37,7 +37,8 @@ def main():
     rd = run_dir(cfg, "stage1")
     (rd / "config.json").write_text(json.dumps(cfg, indent=2))
     timer = Timer(rd / "timing.json", extra={"model": args.model, "task": args.task,
-                                              "num_envs": int(cfg["env"]["num_envs"])})
+                                              "num_envs": int(cfg["env"]["num_envs"]),
+                                              "base_replicas": int(cfg["base"].get("replicas", 1))})
     ep_log = JsonlLogger(rd / "episodes.jsonl")
     learn_log = JsonlLogger(rd / "learner.jsonl")
     s1, rl = cfg["stage1"], cfg["rl"]

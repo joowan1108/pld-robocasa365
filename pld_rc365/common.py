@@ -39,7 +39,8 @@ def build_env_and_base(cfg: dict, scene: str = "fixed", task: str | None = None,
     venv = VecEnv(spec, n, record_root=record_root, gl=cfg["env"].get("mujoco_gl", "egl"),
                   egl_devices=egl.split(",") if egl else None)
     b = cfg["base"]
-    base = BasePolicy(host or b["host"], int(port or b["port"]), n, b["exec_steps"], b["history_indices"])
+    base = BasePolicy(host or b["host"], int(port or b["port"]), n, b["exec_steps"], b["history_indices"],
+                      replicas=int(b.get("replicas", 1)))
     return venv, base, spec
 
 
