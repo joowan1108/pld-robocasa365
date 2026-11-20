@@ -129,8 +129,10 @@ def load_specialists(cfg: dict, path: Path, fmap_shape: tuple, n_cams: int) -> d
 
 
 def make_runner(cfg, venv, base, backbone, specs, num_stages: int) -> Runner:
-    return Runner(venv, base, backbone, cfg["rl"]["device"], num_stages, set(learnable_stage_ids(cfg)),
-                  specs, residual_dims=int(cfg["residual"]["dims"]), gamma=float(cfg["rl"]["discount"]))
+    runner = Runner(venv, base, backbone, cfg["rl"]["device"], num_stages, set(learnable_stage_ids(cfg)),
+                    specs, residual_dims=int(cfg["residual"]["dims"]), gamma=float(cfg["rl"]["discount"]))
+    runner.timeout_terminal = bool(cfg["rl"].get("timeout_terminal", True))
+    return runner
 
 
 def common_argparser(desc: str):

@@ -360,3 +360,32 @@ def test_calql_paper_form_matches_appendix_b1():
     assert abs(info2["cql_gap"] - (info2["q_pi"] - q.mean().item())) < 1e-4
     out = ag.update(b, calql_alpha=1.0)                 # full update runs with the paper form
     assert np.isfinite(out["critic_loss"]) and "q_rand" not in out
+
+
+def test_time_limit_failure_is_terminal_when_enabled():
+    runner, venv, base, specs = make_runner(num_envs=1, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    runner.timeout_terminal = True
+    res = run_n(runner, [EpisodeSpec(seed=1, mode="base", store="online")], 1)
+    assert not res[0].success and res[0].length == 12
+    buf = specs[0].online
+    assert buf.size == 12
+    np.testing.assert_array_equal(buf.data["done"][:12], [0] * 11 + [1])   # only the time-limit step is terminal
+    assert np.all(buf.data["reward"][:12] == 0)                             # ... with reward 0 (failure)
+    assert runner.stats["timeout_terminals"] == 1
+    # a successful episode is unchanged: terminal with reward 1 at the success step, no extra terminal
+    runner2, _, _, specs2 = make_runner(num_envs=1, horizon=12, stage_steps=(5,), succeed=lambda s: True)
+    runner2.timeout_terminal = True
+    res2 = run_n(runner2, [EpisodeSpec(seed=2, mode="base", store="online")], 1)
+    b2 = specs2[0].online
+    assert res2[0].success and b2.data["done"][: b2.size].sum() == 1 and b2.data["reward"][: b2.size].sum() == 1
+    assert runner2.stats.get("timeout_terminals", 0) == 0
+
+
+def test_make_runner_reads_timeout_terminal_from_config():
+    from pld_rc365.common import make_runner as mk
+    from pld_rc365.config import load_config
+    cfg = load_config("xr1", "CoffeeSetupMug", ["rl.device=cpu"])
+    venv = FakeVecEnv(1, 12, (5,), lambda s: True)
+    assert mk(cfg, venv, FakeBase(1, 4), FakeBackbone(), {}, 1).timeout_terminal is True
+    cfg["rl"]["timeout_terminal"] = False
+    assert mk(cfg, venv, FakeBase(1, 4), FakeBackbone(), {}, 1).timeout_terminal is False

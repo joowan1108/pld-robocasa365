@@ -104,6 +104,11 @@ class Runner:
         self.stats = {"env_steps": 0, "residual_steps": 0, "probe_steps": 0}
         self.offline_quota: int | None = None   # max successful episodes pushed to offline buffers
         self.offline_accepted = 0
+        # Time limit reached without success. True: the episode is a failure and ends there -> the last transition
+        # is terminal (done=1, no bootstrap), as in the paper's task formulation (an episode terminates on success
+        # "with a restricted time limit", reward in {0,1} per episode). False: truncation, bootstrap from s_T
+        # (failures then never produce a zero-value target; used by the runs before 2026-11-21).
+        self.timeout_terminal = False
         self.abort_on_stop = True               # drop in-flight episodes once on_end requested a stop
         self.check_consistency = True           # cheap per-step invariants (bug guard, no effect on results)
         self.log_every_s = 120.0                # throughput line on stdout
@@ -294,10 +299,15 @@ class Runner:
             for i in ended:
                 s = states[i]
                 success = bool(s.pkt["success"])
-                if s.pending is not None:  # time-limit truncation: bootstrap with the base action at s_T
-                    self.base.ensure([i])
+                if s.pending is not None:  # the episode hit the time limit without (stage) success
                     k, tr = s.pending
-                    tr["next_a_b"] = self.base.peek(i)
+                    if self.timeout_terminal:   # failure: terminal, nothing to bootstrap from
+                        tr["done"] = 1.0
+                        tr["next_a_b"] = np.zeros_like(tr["a_b"])
+                        self.stats["timeout_terminals"] = self.stats.get("timeout_terminals", 0) + 1
+                    else:                       # truncation: bootstrap with the base action at s_T
+                        self.base.ensure([i])
+                        tr["next_a_b"] = self.base.peek(i)
                     self._push(s, k, tr)
                     s.pending = None
                 self._flush_offline(s, success)

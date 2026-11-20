@@ -102,6 +102,8 @@ def main():
         if online:
             parts.append(f"online eps {len(online)} (takeover {len(took)})")
             parts.append(f"rolling SR {roll:.2f}" if roll is not None else "rolling SR -")
+            if online[-1].get("rolling_sr_all") is not None:   # the paper's metric: all episodes, window 100
+                parts.append(f"all-episode SR {online[-1]['rolling_sr_all']:.2f}")
             if curve:
                 parts.append("curve " + " ".join(f"{c['sr']:.2f}" for c in curve[-6:]))
         rec = [e["residual"] for e in took[-50:] if e.get("residual")]
