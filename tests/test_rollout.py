@@ -389,3 +389,21 @@ def test_make_runner_reads_timeout_terminal_from_config():
     assert mk(cfg, venv, FakeBase(1, 4), FakeBackbone(), {}, 1).timeout_terminal is True
     cfg["rl"]["timeout_terminal"] = False
     assert mk(cfg, venv, FakeBase(1, 4), FakeBackbone(), {}, 1).timeout_terminal is False
+
+
+def test_async_learner_respects_update_ratio():
+    import time
+    from pld_rc365.rl.agent import AsyncLearner
+    runner, venv, base, specs = make_runner(num_envs=1, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    run_n(runner, [EpisodeSpec(seed=1, mode="base", store="online")], 1)      # 12 stored transitions
+    sp = specs[0]
+    for utd, expect in ((2.0, 24), (1.0, 24)):                                # budget = utd * stored; never above it
+        sp.agent.rl["utd"] = utd
+        lr = AsyncLearner(sp.agent, sp.offline, sp.online, sp.collector_actor, sp.actor_lock)
+        lr.start()
+        t0 = time.time()
+        while sp.agent.n_updates < expect and time.time() - t0 < 60:
+            time.sleep(0.05)
+        time.sleep(0.3)
+        lr.stop()
+        assert sp.agent.n_updates == expect, (utd, sp.agent.n_updates)

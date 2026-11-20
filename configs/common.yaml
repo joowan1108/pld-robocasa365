@@ -59,7 +59,10 @@ rl:                          # Table 5
                              # episode terminates and resets on task success with a restricted time limit ... a reward
                              # r in {0,1} is assigned"). false = bootstrap at the time limit: failures then never give a
                              # zero target (all runs before 2026-11-21; Q stayed 0.4-0.6 while success fell to 0.1-0.3).
-  utd: 1.0                   # critic updates per stored online transition (async learner throttle)
+  utd: 2.0                   # critic updates per stored online transition (async learner throttle). With
+                             # critic_actor_ratio 2 this is 2 critic + 1 actor/temperature update per transition, the
+                             # per-cycle pattern of the unofficial implementation (utd: 2). The paper gives no value
+                             # (SERL's learner is asynchronous and unthrottled). 1.0 was used until 2026-11-21.
   actor_sync_every: 50       # learner steps between actor weight pushes to the collector
   offline_successes: 50      # n in Alg. 1
   calql:

@@ -112,6 +112,10 @@ def main():
                          f"|a_d|/|a_vla| {mean(x['abs_over_base'] for x in rec):.2f} xi {rec[-1]['xi']:.2f}")
         if online_l:
             l = online_l[-1]
+            st = online[-1].get("online_steps") if online else None
+            st = sum(st.values()) if isinstance(st, dict) else st
+            if st:   # achieved update ratio (the learner is throttled to rl.utd but may also fall behind)
+                parts.append(f"UTD {l.get('n_updates', 0) / st:.2f}")
             parts.append(f"updates {l.get('n_updates')} critic {l.get('critic_loss', float('nan')):.3g} "
                          f"Q {l.get('q', float('nan')):.2f} alpha {l.get('alpha', float('nan')):.3g}")
         print(" | ".join(parts))
