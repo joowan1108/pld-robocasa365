@@ -58,10 +58,14 @@ rl:                          # Table 5
   offline_successes: 50      # n in Alg. 1
   calql:
     steps: 20000
-    alpha: 0.0          # CQL weight. Paper Fig. 14 compares Cal-QL alpha in {0.0, 0.5, 1.0} (all similar; value used for
-                        # the main runs not stated). Calibration check on the XR1 x CoffeeSetupMug offline buffer (20k
-                        # steps, scripts/calql_sweep.py): alpha=0.0 -> Q(data) vs MC corr 0.95, stable; 0.5 / 1.0 ->
-                        # Q of any non-zero residual -11..-20 (offline data are all residual-free), oscillating.
+    alpha: 1.0          # CQL weight. Paper: critic "initialized by a conservative objective such as Cal-QL"; Fig. 14
+                        # compares alpha in {0.0, 0.5, 1.0} ("robust to the conservative coefficients").
+                        # alpha=0.0 was tried first (best Q(data)-vs-MC calibration: corr 0.95) but on XR1 x
+                        # CoffeeSetupMug the actor then learned a state-independent residual along the VLA's
+                        # near-success motion (arm retreat: offline corr(a_z, MC) = +0.60): in offline/warm-up data
+                        # a_bar == a_b, so the unconstrained critic credits the action input with the progress signal.
+                        # Takeover SR fell 0.68 -> 0.12 (baseline 0.58). The conservative term penalises exactly these
+                        # out-of-data actions (alpha=1.0: Q(random residual) ~ -11 after pre-training).
     num_samples: 10
     random: full        # full: U[-1,1]^d (standard) | residual: a_b + U[-xi,xi]^d
   device: cuda:0
