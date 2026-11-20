@@ -42,7 +42,7 @@ def _free_gpu_gb(index: int) -> float | None:
         return None
 
 
-def cap_num_envs(cfg: dict, n: int, training: bool) -> int:
+def cap_num_envs(cfg: dict, n: int, training: bool, recording: bool = False) -> int:
     e = cfg["env"]
     if not e.get("cap_envs_by_gpu_mem", False):
         return n
@@ -51,7 +51,8 @@ def cap_num_envs(cfg: dict, n: int, training: bool) -> int:
     if any(f is None for f in free):
         return n
     reserve = float(e.get("gpu_mem_reserve_train_gb" if training else "gpu_mem_reserve_eval_gb", 1.0))
-    per = float(e.get("gpu_mem_per_env_gb", 1.2))
+    # envs that record episodes (stage 2) hold more GPU memory: ~1.45 GB vs ~0.9-1.15 GB measured on an RTX 4090
+    per = float(e.get("gpu_mem_per_env_record_gb", 1.5) if recording else e.get("gpu_mem_per_env_gb", 1.2))
     # envs are spread round-robin over the rendering GPUs; the learner lives on the last one
     allowed = sum(max(0, int((f - (reserve if k == len(free) - 1 else 0.0)) // per)) for k, f in enumerate(free))
     if allowed < n:
@@ -69,7 +70,7 @@ def build_env_and_base(cfg: dict, scene: str = "fixed", task: str | None = None,
     limit_threads()
     os.environ.setdefault("MUJOCO_GL", cfg["env"].get("mujoco_gl", "egl"))
     spec = make_spec(cfg, scene=scene, task=task)
-    n = cap_num_envs(cfg, int(num_envs or cfg["env"]["num_envs"]), training)
+    n = cap_num_envs(cfg, int(num_envs or cfg["env"]["num_envs"]), training, recording=record_root is not None)
     cfg["env"]["num_envs_actual"] = n
     egl = os.environ.get("PLD_EGL_DEVICES")
     venv = VecEnv(spec, n, record_root=record_root, gl=cfg["env"].get("mujoco_gl", "egl"),
@@ -88,6 +89,22 @@ def build_backbone(cfg: dict) -> tuple[FrozenBackbone, tuple, int]:
     with torch.no_grad():
         f = bb(torch.zeros(1, n_cams, s, s, 3, dtype=torch.uint8, device=dev))
     return bb, tuple(f.shape[2:]), n_cams
+
+
+def claim_gpu_memory(backbone, specs: dict, num_envs: int, cfg: dict) -> None:
+    """Make this process allocate its CUDA memory now, before the env workers' EGL renderers fill the GPU.
+
+    Stage 1 does this through the learner; stage 2 / eval only run inference, and their first real forward used to
+    come after the renderers had taken everything (stage 2 on an RTX 4090, 8 recording envs + XR1 server:
+    "CUDA out of memory. Tried to allocate 12 MiB", 2026-11-20)."""
+    dev = torch.device(cfg["rl"]["device"])
+    if dev.type != "cuda":
+        return
+    s, n_cams = int(cfg["residual"]["image_size"]), len(cfg["residual"]["cameras"])
+    with torch.no_grad():
+        backbone(torch.zeros(max(1, num_envs), n_cams, s, s, 3, dtype=torch.uint8, device=dev))
+    for sp in specs.values():
+        sp.agent.reserve_gpu_memory()
 
 
 def build_specialists(cfg: dict, fmap_shape: tuple, n_cams: int, stage_ids: list[int],

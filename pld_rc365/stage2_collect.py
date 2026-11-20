@@ -20,7 +20,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .common import (build_backbone, build_env_and_base, common_argparser, load_specialists, make_runner,
+from .common import (build_backbone, build_env_and_base, claim_gpu_memory, common_argparser, load_specialists,
+                     make_runner,
                      sample_t_base)
 from .config import load_config, run_dir
 from .rollout import EpisodeResult, EpisodeSpec
@@ -43,11 +44,14 @@ def main():
     ep_log = JsonlLogger(rd / "episodes.jsonl")
 
     spec_path = Path(args.specialists) if args.specialists else run_dir(cfg, "stage1") / "specialists_final.pt"
-    venv, base, spec = build_env_and_base(cfg, record_root=str(raw_root), training=True)
+    # stage2.num_envs (optional) overrides env.num_envs: recording envs need more GPU memory than stage-1 envs
+    venv, base, spec = build_env_and_base(cfg, record_root=str(raw_root), training=True,
+                                          num_envs=s2.get("num_envs") or None)
     timer.set("num_envs_actual", venv.num_envs)
     horizon = venv.horizon
     backbone, fmap_shape, n_cams = build_backbone(cfg)
     specs = load_specialists(cfg, spec_path, fmap_shape, n_cams)
+    claim_gpu_memory(backbone, specs, venv.num_envs, cfg)
     runner = make_runner(cfg, venv, base, backbone, specs, len(spec.stage_names))
     runner.keep_pure_base = bool(s2["keep_pure_base"])
     rng = np.random.default_rng(cfg["seeds"]["stage2"])

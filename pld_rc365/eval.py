@@ -23,7 +23,8 @@ import json
 
 import numpy as np
 
-from .common import build_backbone, build_env_and_base, common_argparser, load_specialists, make_runner
+from .common import (build_backbone, build_env_and_base, claim_gpu_memory, common_argparser, load_specialists,
+                     make_runner)
 from .config import load_config, run_dir
 from .rollout import EpisodeResult, EpisodeSpec
 from .utils.timing import Timer
@@ -35,6 +36,7 @@ def evaluate(cfg, scene: str, task: str | None, episodes: int, seed_base: int, s
     if specialists_path:
         backbone, fmap_shape, n_cams = build_backbone(cfg)
         specs = load_specialists(cfg, specialists_path, fmap_shape, n_cams)
+        claim_gpu_memory(backbone, specs, venv.num_envs, cfg)
     runner = make_runner(cfg, venv, base, backbone, specs, len(spec.stage_names))
     seeds = iter(range(seed_base, seed_base + episodes))
     res: list[EpisodeResult] = []
