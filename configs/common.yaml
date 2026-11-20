@@ -87,7 +87,8 @@ stage1:
   # warm-up seconds). warmup_cache_actor: keep (identical to an uninterrupted run) | reset (fresh actor+temperature).
   reuse_warmup: false
   warmup_cache_actor: keep
-  max_online_env_steps: 250000   # stored online transitions (paper: 250k online steps)
+  max_online_env_steps: 250000   # stored online transitions (paper: 250k online steps). This, stop_sr and max_wall_hours
+                                 # can be changed during a run: write them to <run dir>/stage1/control.json.
   max_wall_hours: 48
   sr_window: 100                 # Fig. 5 sliding window
   sr_thresholds: [0.8, 0.9, 0.95]

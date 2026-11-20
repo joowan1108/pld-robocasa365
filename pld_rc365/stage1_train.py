@@ -289,9 +289,26 @@ def main():
         thresholds = sorted(float(x) for x in s1["sr_thresholds"])
         crossed: dict[float, float] = {}
         t_online0 = time.time()
-        max_steps = int(s1["max_online_env_steps"])
-        max_wall = float(s1["max_wall_hours"]) * 3600
+        # Limits can be changed while the run is going: write {"max_online_env_steps": N, "stop_sr": x,
+        # "max_wall_hours": h} (any subset) to <run dir>/control.json; it is re-read at every episode end.
+        limits = {"max_online_env_steps": int(s1["max_online_env_steps"]), "stop_sr": float(s1["stop_sr"]),
+                  "max_wall_hours": float(s1["max_wall_hours"])}
+        control = rd / "control.json"
         state = {"episodes": 0, "stop_reason": None}
+
+        def refresh_limits():
+            if not control.exists():
+                return
+            try:
+                new = {k: type(limits[k])(v) for k, v in json.loads(control.read_text()).items() if k in limits}
+            except (ValueError, TypeError) as e:
+                print(f"[stage1] ignoring unreadable {control}: {e}", flush=True)
+                return
+            changed = {k: v for k, v in new.items() if limits[k] != v}
+            if changed:
+                limits.update(changed)
+                timer.set("limits_override", dict(limits))
+                print(f"[stage1] limits changed via control.json: {changed}", flush=True)
 
         def online_spec():
             return EpisodeSpec(seed=next(oseeds), mode="pld", t_base=sample_t_base(cfg, horizon, rng), store="online")
@@ -313,11 +330,12 @@ def main():
                         timer.mark(f"sr>={th}_since_online_start", since=t_online0)
             if state["episodes"] % int(s1["checkpoint_every_episodes"]) == 0:
                 save_specialists(specs, rd / "specialists_latest.pt", {"episodes": state["episodes"], "rolling_sr": sr})
-            if len(window) >= window.maxlen and sr >= float(s1["stop_sr"]):
-                state["stop_reason"] = f"rolling_sr>={s1['stop_sr']}"
-            elif all(sp.agent.online_steps >= max_steps for sp in specs.values()):
+            refresh_limits()
+            if len(window) >= window.maxlen and sr >= limits["stop_sr"]:
+                state["stop_reason"] = f"rolling_sr>={limits['stop_sr']}"
+            elif all(sp.agent.online_steps >= limits["max_online_env_steps"] for sp in specs.values()):
                 state["stop_reason"] = "max_online_env_steps"
-            elif time.time() - t_online0 > max_wall:
+            elif time.time() - t_online0 > limits["max_wall_hours"] * 3600:
                 state["stop_reason"] = "max_wall_hours"
             return state["stop_reason"] is not None
 

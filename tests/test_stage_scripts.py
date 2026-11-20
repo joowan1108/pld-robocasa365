@@ -151,3 +151,20 @@ def test_stage1_warmup_cache_saved_and_reused(patched, monkeypatch):
                                              "rl.calql.steps=4"])
     s1.main()
     assert called["calql"] == 1 and len(sorted(cache.glob("warmup_*"))) == 2
+
+
+def test_stage1_limits_can_be_changed_while_running(patched, monkeypatch):
+    """control.json in the run dir overrides the step budget at the next episode end."""
+    import pld_rc365.stage1_train as s1
+
+    runs = patched / "runs"
+    rd = runs / "xr1" / "CoffeeSetupMug" / "stage1"
+    rd.mkdir(parents=True)
+    (rd / "control.json").write_text(json.dumps({"max_online_env_steps": 60, "stop_sr": 2.0}))
+    monkeypatch.setattr(sys, "argv", ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--skip-final-eval",
+                                      "--set", *TINY, f"paths.runs_root={runs}", "stage1.max_online_env_steps=100000"])
+    s1.main()
+    timing = json.loads((rd / "timing.json").read_text())
+    assert timing["extra"]["online"]["stop_reason"] == "max_online_env_steps"        # not rolling_sr (stop_sr=2.0)
+    assert timing["extra"]["limits_override"]["max_online_env_steps"] == 60
+    assert 60 <= timing["extra"]["online"]["online_steps"]["0"] < 200
