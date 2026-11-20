@@ -81,6 +81,9 @@ stage1:
   # reuse_offline: true -> load it instead of collecting (timing.json then records the reuse + the source's
   # collection time). Off by default so Stage-1 wall-clock measurements include the collection.
   reuse_offline: false
+  # init_seed_pool: N > 0 -> all Stage-1 episodes reset from N fixed seeds (a small fixed set of initial states, like
+  # LIBERO's init states) instead of a new object instance / placement per episode. 0 = off (default). Diagnostic.
+  init_seed_pool: 0
   # The state after Cal-QL + warm-up (critic + optimiser, actor, temperature, warm-up transitions, counters) is
   # always saved to offline_cache/<key>/warmup_<hash>/; the hash covers everything it depends on except xi.
   # reuse_warmup: true -> load it and go straight to online RL (timing.json records the source's Cal-QL and

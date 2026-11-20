@@ -79,6 +79,7 @@ class _EnvState:
     traj: list = field(default_factory=list)   # offline: (stage, transition)
     n_stored: int = 0
     scene: tuple | None = None                 # (layout_id, style_id) sampled at reset
+    init: list | None = None                   # initial proprio (rounded): fingerprint of the reset state
     res_n: int = 0                             # residual-acted steps in this episode
     res_sum: np.ndarray | None = None          # sum of a_delta per dim
     res_abs: np.ndarray | None = None          # sum of |a_delta| per dim
@@ -170,7 +171,8 @@ class Runner:
             self.base.reset_env(i, pkt)
             ls = pkt.get("layout_style")
             states[i] = _EnvState(spec=sp, pkt=pkt, stage=pkt["stage"],
-                                  scene=tuple(int(x) for x in ls) if ls and None not in ls else None)
+                                  scene=tuple(int(x) for x in ls) if ls and None not in ls else None,
+                                  init=[round(float(v), 4) for v in np.asarray(pkt["proprio"]).ravel()[:10]])
 
         for i in range(self.venv.num_envs):
             start(i)
@@ -306,7 +308,8 @@ class Runner:
                 res = EpisodeResult(spec=s.spec, success=success, length=s.t, stage_reached=s.stage,
                                     took_over=s.took_over, takeover_step=s.takeover_step,
                                     n_stored=s.n_stored, rec_dir=rec_dir, wall_s=time.time() - s.t0,
-                                    extra={"scene": s.scene, "residual": self._residual_summary(s)})
+                                    extra={"scene": s.scene, "init": s.init,
+                                           "residual": self._residual_summary(s)})
                 if on_end is not None and on_end(res):
                     stopping = True
                 start(i)

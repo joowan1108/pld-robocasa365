@@ -183,3 +183,19 @@ def test_offline_cache_is_keyed_by_exec_steps(patched, monkeypatch):
         rd.rename(rd.with_name(f"stage1_e{ex}"))
     caches = sorted(p.name for p in (runs / "xr1" / "CoffeeSetupMug" / "offline_cache").iterdir())
     assert caches == ["L11_S34_n2_e16", "L11_S34_n2_e4"]      # separate buffers, nothing overwritten
+
+
+def test_stage1_fixed_initial_state_pool(patched, monkeypatch):
+    import pld_rc365.stage1_train as s1
+
+    runs = patched / "runs"
+    monkeypatch.setattr(sys, "argv", ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--set", *TINY,
+                                      f"paths.runs_root={runs}", "stage1.init_seed_pool=3"])
+    s1.main()
+    rd = runs / "xr1" / "CoffeeSetupMug" / "stage1"
+    eps = [json.loads(l) for l in (rd / "episodes.jsonl").read_text().splitlines()]
+    pool = {100000, 100001, 100002}
+    assert {e["phase"] for e in eps} >= {"offline", "warmup", "online", "final_eval"}
+    assert {e["seed"] for e in eps} <= pool and all(e.get("init") is not None for e in eps)
+    assert json.loads((rd / "timing.json").read_text())["extra"]["init_seed_pool"] == sorted(pool)
+    assert (runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / "L11_S34_n2_e16_p3" / "meta.json").exists()

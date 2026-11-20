@@ -32,12 +32,27 @@ from .rollout import EpisodeResult, EpisodeSpec
 from .utils.timing import JsonlLogger, Timer
 
 
+def init_seed_pool(cfg: dict) -> list[int]:
+    """stage1.init_seed_pool = N > 0: every Stage-1 episode (offline, warm-up, online, final eval) resets from one of
+    N fixed seeds, i.e. a small fixed set of initial states (like LIBERO's fixed init states) instead of a new object
+    instance / placement every episode. Diagnostic for whether residual RL can learn in the simplest setting."""
+    n = int(cfg["stage1"].get("init_seed_pool", 0) or 0)
+    return [int(cfg["seeds"]["offline"]) + i for i in range(n)]
+
+
+def seed_stream(cfg: dict, base: int):
+    pool = init_seed_pool(cfg)
+    return itertools.cycle(pool) if pool else itertools.count(base)
+
+
 def offline_cache_dir(cfg: dict, spec, n_off: int) -> Path:
     root = Path(cfg["paths"]["runs_root"])
     root = root if root.is_absolute() else REPO_ROOT / root
     # exec_steps (how many actions of each VLA chunk are executed before re-planning) changes the base policy's
     # behaviour, so it is part of the key: runs with a different value never overwrite each other's buffers.
     key = f"L{spec.layout_id}_S{spec.style_id}_n{n_off}_e{int(cfg['base']['exec_steps'])}"
+    if init_seed_pool(cfg):
+        key += f"_p{len(init_seed_pool(cfg))}"
     return root / cfg["model_name"] / cfg["task_name"] / "offline_cache" / key
 
 
@@ -50,6 +65,7 @@ def offline_meta(cfg: dict, spec, fmap_shape, n_cams: int, n_off: int) -> dict:
         "fmap_shape": list(fmap_shape), "n_cams": n_cams, "gamma": float(cfg["rl"]["discount"]),
         "n_successes": n_off, "base_model_path": cfg["base"]["model_path"], "exec_steps": int(cfg["base"]["exec_steps"]),
         "offline_seed_base": int(cfg["seeds"]["offline"]),
+        **({"init_seed_pool": len(init_seed_pool(cfg))} if init_seed_pool(cfg) else {}),
     }
 
 
@@ -84,6 +100,7 @@ def warmup_meta(cfg: dict, offline_src: dict) -> dict:
         "rl": {k: v for k, v in cfg["rl"].items() if k not in WARMUP_KEY_EXCLUDE_RL},
         "residual": {k: v for k, v in cfg["residual"].items() if k not in WARMUP_KEY_EXCLUDE_RES},
         "warmup_seed_base": int(cfg["seeds"]["warmup"]),
+        **({"init_seed_pool": len(init_seed_pool(cfg))} if init_seed_pool(cfg) else {}),
         "stage_ids": sorted(int(k) for k in learnable_stage_ids(cfg)),
     }
 
@@ -156,7 +173,7 @@ def main():
     def episode_record(phase: str, r: EpisodeResult, **kw) -> dict:
         return dict(phase=phase, seed=r.spec.seed, success=r.success, length=r.length, stage=r.stage_reached,
                     t_base=r.spec.t_base, took_over=r.took_over, takeover_step=r.takeover_step,
-                    n_stored=r.n_stored, wall_s=r.wall_s, scene=r.extra.get("scene"),
+                    n_stored=r.n_stored, wall_s=r.wall_s, scene=r.extra.get("scene"), init=r.extra.get("init"),
                     residual=r.extra.get("residual"), **kw)
 
     def log_episode(phase: str, r: EpisodeResult, **kw) -> dict:
@@ -167,7 +184,9 @@ def main():
     try:
         # ------------------------------------------------------------ offline successes
         n_off = int(rl["offline_successes"])
-        seeds = itertools.count(cfg["seeds"]["offline"])
+        seeds = seed_stream(cfg, cfg["seeds"]["offline"])
+        if init_seed_pool(cfg):
+            timer.set("init_seed_pool", init_seed_pool(cfg))
         counts = {"episodes": 0, "successes": 0, "succ_len": []}
         runner.offline_quota = n_off
 
@@ -253,7 +272,7 @@ def main():
 
             # -------------------------------------------------------- warm-up (base-only, stored)
             n_warm = int(rl["warmup_episodes"])
-            wseeds = itertools.count(cfg["seeds"]["warmup"])
+            wseeds = seed_stream(cfg, cfg["seeds"]["warmup"])
             wcount = {"n": 0, "issued": 0}
             wrecords: list[dict] = []
 
@@ -285,7 +304,7 @@ def main():
             start_learners()
 
         # ------------------------------------------------------------ online PLD training
-        oseeds = itertools.count(cfg["seeds"]["online"])
+        oseeds = seed_stream(cfg, cfg["seeds"]["online"])
         window = collections.deque(maxlen=int(s1["sr_window"]))
         window_all = collections.deque(maxlen=int(s1["sr_window"]))
         thresholds = sorted(float(x) for x in s1["sr_thresholds"])
@@ -362,7 +381,9 @@ def main():
         # ------------------------------------------------------------ clean evaluation of pi_bar
         if not args.skip_final_eval:
             n_eval = int(s1["final_eval_episodes"])
-            eseeds = iter(range(cfg["eval"]["seed_base"], cfg["eval"]["seed_base"] + n_eval))
+            pool = init_seed_pool(cfg)
+            eseeds = iter([pool[j % len(pool)] for j in range(n_eval)] if pool else
+                          range(cfg["eval"]["seed_base"], cfg["eval"]["seed_base"] + n_eval))
             res: list[EpisodeResult] = []
 
             def eval_spec():
