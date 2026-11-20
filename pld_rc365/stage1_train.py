@@ -18,15 +18,50 @@ import collections
 import itertools
 import json
 import time
+from pathlib import Path
 
 import numpy as np
 
 from .common import (build_backbone, build_env_and_base, build_specialists, common_argparser, learnable_stage_ids,
                      make_runner, sample_t_base, save_specialists, sync_collectors)
-from .config import load_config, run_dir
+from .config import REPO_ROOT, load_config, run_dir
 from .rl.agent import AsyncLearner
 from .rollout import EpisodeResult, EpisodeSpec
 from .utils.timing import JsonlLogger, Timer
+
+
+def offline_cache_dir(cfg: dict, spec, n_off: int) -> Path:
+    root = Path(cfg["paths"]["runs_root"])
+    root = root if root.is_absolute() else REPO_ROOT / root
+    key = f"L{spec.layout_id}_S{spec.style_id}_n{n_off}"
+    return root / cfg["model_name"] / cfg["task_name"] / "offline_cache" / key
+
+
+def offline_meta(cfg: dict, spec, fmap_shape, n_cams: int, n_off: int) -> dict:
+    """Everything the stored transitions depend on; a reuse must match all of it."""
+    return {
+        "model": cfg["model_name"], "task": cfg["task_name"], "layout_id": spec.layout_id, "style_id": spec.style_id,
+        "obj_instance_split": cfg["env"].get("obj_instance_split"), "stage_names": list(spec.stage_names),
+        "residual_cameras": list(cfg["residual"]["cameras"]), "image_size": int(cfg["residual"]["image_size"]),
+        "fmap_shape": list(fmap_shape), "n_cams": n_cams, "gamma": float(cfg["rl"]["discount"]),
+        "n_successes": n_off, "base_model_path": cfg["base"]["model_path"], "exec_steps": int(cfg["base"]["exec_steps"]),
+        "offline_seed_base": int(cfg["seeds"]["offline"]),
+    }
+
+
+def save_offline_cache(cache: Path, specs: dict, meta: dict) -> None:
+    import subprocess
+
+    cache.mkdir(parents=True, exist_ok=True)
+    for k, sp in specs.items():
+        sp.offline.save(cache / f"stage{k}.npz")
+    try:
+        meta["git_commit"] = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT,
+                                            capture_output=True, text=True).stdout.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    (cache / "meta.json").write_text(json.dumps(meta, indent=2, default=float))
+    print(f"[stage1] offline buffer saved to {cache}", flush=True)
 
 
 def main():
@@ -76,14 +111,34 @@ def main():
             log_episode("offline", r)
             return counts["successes"] >= n_off
 
-        with timer.phase("offline_collect"):
-            runner.run(lambda: EpisodeSpec(seed=next(seeds), mode="base", store="offline"), off_end)
-        timer.set("offline", {
-            "episodes": counts["episodes"], "successes": counts["successes"],
-            "base_sr_fixed_scene": counts["successes"] / max(1, counts["episodes"]),
-            "mean_success_length": float(np.mean(counts["succ_len"])) if counts["succ_len"] else None,
-            "offline_transitions": {k: len(sp.offline) for k, sp in specs.items()},
-        })
+        cache = offline_cache_dir(cfg, spec, n_off)
+        meta_now = offline_meta(cfg, spec, fmap_shape, n_cams, n_off)
+        if s1.get("reuse_offline") and (cache / "meta.json").exists():
+            src = json.loads((cache / "meta.json").read_text())
+            mismatch = {k: (src.get(k), v) for k, v in meta_now.items() if src.get(k) != v}
+            if mismatch:
+                raise RuntimeError(f"offline cache {cache} is incompatible: {mismatch}")
+            with timer.phase("offline_load"):
+                for k, sp in specs.items():
+                    sp.offline.load(cache / f"stage{k}.npz")
+            timer.set("offline", {**src["stats"], "reused_from": str(cache),
+                                  "offline_transitions": {k: len(sp.offline) for k, sp in specs.items()}})
+            timer.add_phase_seconds("offline_collect", float(src["stats"]["collect_seconds"]))
+            timer.set("offline_collect_is_from_cache", True)
+        else:
+            with timer.phase("offline_collect"):
+                runner.run(lambda: EpisodeSpec(seed=next(seeds), mode="base", store="offline"), off_end)
+            stats = {
+                "episodes": counts["episodes"], "successes": counts["successes"],
+                "base_sr_fixed_scene": counts["successes"] / max(1, counts["episodes"]),
+                "mean_success_length": float(np.mean(counts["succ_len"])) if counts["succ_len"] else None,
+                "collect_seconds": timer.data["phases"]["offline_collect"]["seconds"],
+                "num_envs": venv.num_envs,
+            }
+            timer.set("offline", {**stats, "offline_transitions": {k: len(sp.offline) for k, sp in specs.items()}})
+            save_offline_cache(cache, specs, {**meta_now, "stats": stats, "source_run": str(rd),
+                                              "hardware": timer.data["hardware"], "created": time.time()})
+            timer.set("offline_cache", str(cache))
 
         # ------------------------------------------------------------ Cal-QL critic warm-start
         with timer.phase("calql_pretrain"):

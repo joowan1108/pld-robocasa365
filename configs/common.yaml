@@ -59,6 +59,10 @@ rl:                          # Table 5
   device: cuda:0
 
 stage1:
+  # Offline buffer (n base successes) is always saved to runs/<model>/<task>/offline_cache/<key>/ after collection.
+  # reuse_offline: true -> load it instead of collecting (timing.json then records the reuse + the source's
+  # collection time). Off by default so Stage-1 wall-clock measurements include the collection.
+  reuse_offline: false
   max_online_env_steps: 250000   # stored online transitions (paper: 250k online steps)
   max_wall_hours: 48
   sr_window: 100                 # Fig. 5 sliding window

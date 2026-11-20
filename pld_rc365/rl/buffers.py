@@ -65,6 +65,21 @@ class ReplayBuffer:
             np.savez(path, size=self.size, ptr=self.ptr, total_added=self.total_added,
                      **{k: v[: self.size] for k, v in self.data.items()})
 
+    def load(self, path) -> int:
+        """Replace the contents with a buffer saved by save() (shapes must match). Returns #loaded."""
+        d = np.load(path)
+        n = int(d["size"])
+        for k in FIELDS:
+            if d[k].shape[1:] != self.data[k].shape[1:]:
+                raise ValueError(f"{path}: field {k} shape {d[k].shape[1:]} != buffer {self.data[k].shape[1:]}")
+        if n > self.capacity:
+            raise ValueError(f"{path}: {n} transitions > capacity {self.capacity}")
+        with self.lock:
+            for k in FIELDS:
+                self.data[k][:n] = d[k][:n]
+            self.size = self.ptr = self.total_added = n
+        return n
+
 
 def symmetric_sample(offline: ReplayBuffer, online: ReplayBuffer, batch: int, rng) -> dict[str, np.ndarray]:
     """RLPD / PLD: half the batch from each buffer (all offline while the online buffer is empty)."""

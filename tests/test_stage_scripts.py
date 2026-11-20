@@ -69,3 +69,38 @@ def test_stage1_then_stage2(patched, monkeypatch):
     assert "successes_1" in t2["marks"] and "successes_3" in t2["marks"]
     kept = json.loads((rd2 / "kept_episodes.json").read_text())
     assert len(kept) == 3 and all(k["length"] == 5 for k in kept)
+
+
+def test_stage1_offline_buffer_saved_and_reused(patched, monkeypatch):
+    import pld_rc365.stage1_train as s1
+
+    runs = patched / "runs"
+    common = ["--model", "xr1", "--task", "CoffeeSetupMug", "--skip-final-eval", "--set", *TINY,
+              f"paths.runs_root={runs}"]
+    monkeypatch.setattr(sys, "argv", ["stage1", *common])
+    s1.main()
+    cache = runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / "L11_S34_n2"
+    meta = json.loads((cache / "meta.json").read_text())
+    assert (cache / "stage0.npz").exists() and meta["stats"]["successes"] == 2 and meta["gamma"] == 0.99
+    first = json.loads((runs / "xr1" / "CoffeeSetupMug" / "stage1" / "timing.json").read_text())
+
+    # second run (fresh stage1 dir) reuses the cache: no offline episodes, same transitions, reuse recorded
+    (runs / "xr1" / "CoffeeSetupMug" / "stage1").rename(runs / "xr1" / "CoffeeSetupMug" / "stage1_first")
+    monkeypatch.setattr(sys, "argv", ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--skip-final-eval",
+                                      "--set", *TINY, f"paths.runs_root={runs}", "stage1.reuse_offline=true"])
+    s1.main()
+    rd = runs / "xr1" / "CoffeeSetupMug" / "stage1"
+    t2 = json.loads((rd / "timing.json").read_text())
+    phases = [json.loads(l)["phase"] for l in (rd / "episodes.jsonl").read_text().splitlines()]
+    assert "offline" not in phases and "offline_load" in t2["phases"]
+    assert t2["extra"]["offline"]["reused_from"] == str(cache)
+    assert t2["extra"]["offline"]["offline_transitions"] == first["extra"]["offline"]["offline_transitions"]
+    assert t2["phases"]["offline_collect"]["seconds"] == meta["stats"]["collect_seconds"]
+
+    # incompatible settings must refuse the cache
+    (rd).rename(runs / "xr1" / "CoffeeSetupMug" / "stage1_second")
+    monkeypatch.setattr(sys, "argv", ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--skip-final-eval",
+                                      "--set", *TINY, f"paths.runs_root={runs}", "stage1.reuse_offline=true",
+                                      "rl.discount=0.98"])
+    with pytest.raises(RuntimeError, match="incompatible"):
+        s1.main()
