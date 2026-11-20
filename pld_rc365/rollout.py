@@ -79,6 +79,12 @@ class _EnvState:
     traj: list = field(default_factory=list)   # offline: (stage, transition)
     n_stored: int = 0
     scene: tuple | None = None                 # (layout_id, style_id) sampled at reset
+    res_n: int = 0                             # residual-acted steps in this episode
+    res_sum: np.ndarray | None = None          # sum of a_delta per dim
+    res_abs: np.ndarray | None = None          # sum of |a_delta| per dim
+    res_bound: np.ndarray | None = None        # count of |a_delta| > 0.95 xi per dim
+    base_abs: np.ndarray | None = None         # sum of |a_b[:d]| over the same steps (VLA action scale)
+    res_xi: float | None = None
     t0: float = field(default_factory=time.time)
 
 
@@ -231,7 +237,18 @@ class Runner:
                         np.stack([a_b[i] for i in idxs]),
                         deterministic=det,
                     )
+                xi_now = float(sp.agent.xi)
                 for i, ad in zip(idxs, a_d):
+                    s_ = states[i]
+                    if s_.res_sum is None:
+                        z = np.zeros(self.d)
+                        s_.res_sum, s_.res_abs, s_.res_bound, s_.base_abs = z.copy(), z.copy(), z.copy(), z.copy()
+                    s_.res_n += 1
+                    s_.res_sum += ad
+                    s_.res_abs += np.abs(ad)
+                    s_.res_bound += np.abs(ad) > 0.95 * xi_now
+                    s_.base_abs += np.abs(a_b[i][: self.d])
+                    s_.res_xi = xi_now
                     ab = np.clip(a_b[i][: self.d] + ad, -1.0, 1.0)
                     act = a_b[i].copy()
                     act[: self.d] = ab
@@ -289,7 +306,7 @@ class Runner:
                 res = EpisodeResult(spec=s.spec, success=success, length=s.t, stage_reached=s.stage,
                                     took_over=s.took_over, takeover_step=s.takeover_step,
                                     n_stored=s.n_stored, rec_dir=rec_dir, wall_s=time.time() - s.t0,
-                                    extra={"scene": s.scene})
+                                    extra={"scene": s.scene, "residual": self._residual_summary(s)})
                 if on_end is not None and on_end(res):
                     stopping = True
                 start(i)
@@ -299,6 +316,18 @@ class Runner:
                         self.venv.finish(i, False)
                     states.pop(i)
         self.base.drain()  # leave no request in flight for the next run() (envs get reset there)
+
+    @staticmethod
+    def _residual_summary(s: "_EnvState") -> dict | None:
+        """Per-episode residual statistics (per action dim: eef dx dy dz rx ry rz, gripper)."""
+        if not s.res_n:
+            return None
+        n = float(s.res_n)
+        r = lambda x: [round(float(v), 4) for v in x]  # noqa: E731
+        return {"steps": s.res_n, "xi": s.res_xi, "mean": r(s.res_sum / n), "mean_abs": r(s.res_abs / n),
+                "at_bound": r(s.res_bound / n), "base_abs": r(s.base_abs / n),
+                "abs_over_xi": round(float((s.res_abs / n).mean() / max(s.res_xi, 1e-8)), 4),
+                "abs_over_base": round(float((s.res_abs / n)[:6].sum() / max((s.base_abs / n)[:6].sum(), 1e-8)), 4)}
 
     def _check_step(self, i, popped, a_b, action, a_bar, pkt):
         """Invariants between what was stored and what was executed (raise on the first violation):

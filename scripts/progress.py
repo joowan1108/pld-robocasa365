@@ -104,6 +104,10 @@ def main():
             parts.append(f"rolling SR {roll:.2f}" if roll is not None else "rolling SR -")
             if curve:
                 parts.append("curve " + " ".join(f"{c['sr']:.2f}" for c in curve[-6:]))
+        rec = [e["residual"] for e in took[-50:] if e.get("residual")]
+        if rec:
+            parts.append(f"residual |a_d|/xi {mean(x['abs_over_xi'] for x in rec):.2f} "
+                         f"|a_d|/|a_vla| {mean(x['abs_over_base'] for x in rec):.2f} xi {rec[-1]['xi']:.2f}")
         if online_l:
             l = online_l[-1]
             parts.append(f"updates {l.get('n_updates')} critic {l.get('critic_loss', float('nan')):.3g} "
@@ -129,6 +133,14 @@ def main():
             for c in curve:
                 bar = "#" * int(round(40 * (c["sr"] or 0)))
                 print(f"  ep {c['episodes']:6d}  {c['minutes']:7.1f} min  SR {c['sr']:.2f} {bar}")
+        rec = [e["residual"] for e in took[-50:] if e.get("residual")]
+        if rec:
+            names = ["dx", "dy", "dz", "rx", "ry", "rz", "grip"]
+            avg = lambda key: [mean(x[key][j] for x in rec) for j in range(len(names))]  # noqa: E731
+            print(f"residual (last {len(rec)} takeover eps, xi now {rec[-1]['xi']:.3f}):")
+            print("   dim   mean  mean|.|  at_bound  |VLA a|")
+            for j, nm in enumerate(names):
+                print(f"  {nm:>4} {avg('mean')[j]:+.3f}  {avg('mean_abs')[j]:.3f}    {avg('at_bound')[j]:.2f}     {avg('base_abs')[j]:.3f}")
         if calql_l:
             c = calql_l[-1]
             print(f"Cal-QL       : last step {c.get('step')} critic {c.get('critic_loss')} cql_gap {c.get('cql_gap')} Q {c.get('q')}")

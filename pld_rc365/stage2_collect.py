@@ -68,7 +68,8 @@ def main():
         st["successes"] += int(r.success)
         ep_log.log(seed=r.spec.seed, success=r.success, length=r.length, t_base=r.spec.t_base,
                    took_over=r.took_over, takeover_step=r.takeover_step, stage=r.stage_reached,
-                   kept=r.rec_dir is not None, wall_s=r.wall_s, scene=r.extra.get("scene"))
+                   kept=r.rec_dir is not None, wall_s=r.wall_s, scene=r.extra.get("scene"),
+                   residual=r.extra.get("residual"))
         if r.rec_dir is not None:
             kept.append({"dir": r.rec_dir, "seed": r.spec.seed, "t_base": r.spec.t_base, "length": r.length,
                          "took_over": r.took_over, "takeover_step": r.takeover_step, "pure_base": not r.took_over})

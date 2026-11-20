@@ -96,7 +96,8 @@ def main():
     def log_episode(phase: str, r: EpisodeResult, **kw):
         ep_log.log(phase=phase, seed=r.spec.seed, success=r.success, length=r.length, stage=r.stage_reached,
                    t_base=r.spec.t_base, took_over=r.took_over, takeover_step=r.takeover_step,
-                   n_stored=r.n_stored, wall_s=r.wall_s, scene=r.extra.get("scene"), **kw)
+                   n_stored=r.n_stored, wall_s=r.wall_s, scene=r.extra.get("scene"),
+                   residual=r.extra.get("residual"), **kw)
 
     try:
         # ------------------------------------------------------------ offline successes

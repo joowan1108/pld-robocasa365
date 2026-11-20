@@ -301,3 +301,13 @@ def test_reserve_gpu_memory_is_a_noop_for_weights():
     sp.agent.reserve_gpu_memory(force=True)         # same code path on CPU
     assert all(torch.equal(before[k], v) for k, v in sp.agent.critic.state_dict().items())
     assert all(p.grad is None for p in sp.agent.critic.parameters())
+
+
+def test_episode_residual_summary_is_logged():
+    runner, venv, base, specs = make_runner(num_envs=1, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    res = run_n(runner, [EpisodeSpec(seed=1, mode="pld", t_base=4, store="online"),
+                         EpisodeSpec(seed=3, mode="base", store="online")], 2)
+    r = res[0].extra["residual"]
+    assert r["steps"] == 8 and len(r["mean_abs"]) == 7 and r["xi"] == pytest.approx(0.5)
+    assert all(0 <= v <= 0.5 + 1e-6 for v in r["mean_abs"]) and 0 <= r["abs_over_xi"] <= 1.0 + 1e-6
+    assert res[1].extra["residual"] is None          # base-only episode: no residual acted
