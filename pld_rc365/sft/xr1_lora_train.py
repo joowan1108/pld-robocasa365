@@ -31,7 +31,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from ..base.xr1_server import ROBOT_TYPE, encode_inputs
+from ..base.xr1_server import ROBOT_TYPE, encode_inputs, pad_and_stack
 from .lerobot_reader import LeRobotEpisodes
 
 def lora_targets(n_llm_layers: int) -> str:
@@ -69,22 +69,10 @@ class XR1Dataset(torch.utils.data.Dataset):
 
 def make_collate(pad_id: int):
     def collate(items):
-        L = max(it["input_ids"].shape[1] for it in items)
-        ids = torch.full((len(items), L), pad_id, dtype=items[0]["input_ids"].dtype)
-        am = torch.zeros((len(items), L), dtype=items[0]["attention_mask"].dtype)
-        for j, it in enumerate(items):  # right padding; the DiT reads the VLM attention mask for the cache
-            n = it["input_ids"].shape[1]
-            ids[j, :n] = it["input_ids"][0]
-            am[j, :n] = it["attention_mask"][0]
-        return {
-            "input_ids": ids, "attention_mask": am,
-            "pixel_values_videos": torch.cat([it["pixel_values_videos"] for it in items], 0),
-            "video_grid_thw": torch.cat([it["video_grid_thw"] for it in items], 0),
-            "state": torch.cat([it["state"] for it in items], 0),
-            "action_mask": torch.cat([it["action_mask"] for it in items], 0),
-            "target": torch.stack([it["target"] for it in items]),
-            "valid": torch.stack([it["valid"] for it in items]),
-        }
+        out = pad_and_stack(items, pad_id)  # same batching as the inference server
+        out["target"] = torch.stack([it["target"] for it in items])
+        out["valid"] = torch.stack([it["valid"] for it in items])
+        return out
     return collate
 
 

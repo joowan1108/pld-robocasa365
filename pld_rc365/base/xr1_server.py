@@ -91,6 +91,28 @@ def encode_inputs(processor, video: dict[str, np.ndarray], state: dict[str, np.n
     )
 
 
+def pad_and_stack(items: list[dict], pad_id: int) -> dict:
+    """Batch per-sample processor outputs: right-pad input_ids / attention_mask, concatenate the flattened video
+    patches + grids, stack state / action_mask. The DiT reads the VLM attention mask for the cache, so right padding
+    is exact (tests/test_xr1_tiny.py checks batched == per-sample)."""
+    import torch
+
+    L = max(it["input_ids"].shape[1] for it in items)
+    ids = torch.full((len(items), L), pad_id, dtype=items[0]["input_ids"].dtype)
+    am = torch.zeros((len(items), L), dtype=items[0]["attention_mask"].dtype)
+    for j, it in enumerate(items):
+        n = it["input_ids"].shape[1]
+        ids[j, :n] = it["input_ids"][0]
+        am[j, :n] = it["attention_mask"][0]
+    return {
+        "input_ids": ids, "attention_mask": am,
+        "pixel_values_videos": torch.cat([it["pixel_values_videos"] for it in items], 0),
+        "video_grid_thw": torch.cat([it["video_grid_thw"] for it in items], 0),
+        "state": torch.cat([it["state"] for it in items], 0),
+        "action_mask": torch.cat([it["action_mask"] for it in items], 0),
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", default="XiaomiRobotics/Xiaomi-Robotics-1-RoboCasa365")
@@ -98,6 +120,8 @@ def main():
     ap.add_argument("--port", type=int, default=22000)
     ap.add_argument("--crop-ratio", type=float, default=0.95)
     ap.add_argument("--num-steps", type=int, default=5)
+    ap.add_argument("--max-batch", type=int, default=16,
+                    help="envs per forward pass; 1 = the reference evaluator's per-env calls (much slower)")
     ap.add_argument("--attn", default="flash_attention_2", choices=["flash_attention_2", "eager"],
                     help="MiBoT supports flash_attention_2 or eager only (no sdpa); use eager if flash-attn won't build")
     args = ap.parse_args()
@@ -123,16 +147,21 @@ def main():
             for k, v in d.items()
         }
 
+    pad_id = processor.tokenizer.pad_token_id
+
     def handler(batch: list[dict]) -> np.ndarray:
+        # Batched forward: a B=1 call costs ~280 ms on a 4090 and is launch-bound (GPU ~5% busy), so the envs that
+        # replan together are run as one right-padded batch (same result per env as B=1, up to the noise draw).
         out = []
-        # One forward per env: prompts differ in length (object names), and the reference evaluator is B=1.
-        for b in batch:
-            inputs = to_dev(dict(encode_inputs(processor, b["video"], b["state"], b["lang"], args.crop_ratio)))
+        for s in range(0, len(batch), args.max_batch):
+            part = batch[s:s + args.max_batch]
+            encs = [dict(encode_inputs(processor, b["video"], b["state"], b["lang"], args.crop_ratio)) for b in part]
+            inputs = to_dev(pad_and_stack(encs, pad_id) if len(encs) > 1 else encs[0])
             with torch.inference_mode():
                 actions = model(**inputs, num_steps=args.num_steps, logits_to_keep=1).actions
             actions = processor.decode_action(actions.cpu(), robot_type=ROBOT_TYPE)
-            out.append(actions[0, :, :12].float().numpy())
-        return np.stack(out).astype(np.float32)
+            out.append(actions[:, :, :12].float().numpy())
+        return np.concatenate(out).astype(np.float32)
 
     seed = os.environ.get("MIBOT_SERVER_SEED", "7+device")
     Server(args.host, args.port, handler,

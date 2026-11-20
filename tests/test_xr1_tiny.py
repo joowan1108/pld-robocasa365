@@ -172,3 +172,33 @@ def test_merged_checkpoint_reloads_with_same_outputs(tiny, tmp_path):
     torch.testing.assert_close(a.float(), b.float(), rtol=1e-2, atol=1e-3)  # bf16 round-trip
     assert (tmp_path / "merged" / "processing_mibot.py").exists()
     assert (tmp_path / "merged" / "tokenizer.json").exists()
+
+
+def test_batched_inference_forward_equals_per_env(tiny):
+    """The server's batched handler: model.forward on a right-padded batch == per-env B=1 calls with the same noise."""
+    import torch
+
+    from pld_rc365.base.xr1_server import encode_inputs, pad_and_stack
+
+    model, proc = tiny
+    rng = np.random.default_rng(5)
+    encs = []
+    for lang in ("pick the mug", "pick the yellow and white striped coffee mug from the counter", "open the door"):
+        e = dict(encode_inputs(proc, *_sample(rng, lang), 0.95))
+        encs.append({k: (v.to(torch.bfloat16) if torch.is_floating_point(v) else v) for k, v in e.items()})
+    batch = pad_and_stack(encs, proc.tokenizer.pad_token_id)
+    noise = torch.randn(len(encs), 16, 60).to(torch.bfloat16)
+    real = torch.randn_like
+    try:  # inject the same initial noise in both paths
+        torch.randn_like = lambda x, **kw: noise[: x.shape[0]].clone() if x.shape[0] == len(encs) else None
+        with torch.no_grad():
+            out_b = model(**batch, num_steps=3).actions
+        outs = []
+        for j, e in enumerate(encs):
+            torch.randn_like = lambda x, j=j, **kw: noise[j:j + 1].clone()
+            with torch.no_grad():
+                outs.append(model(**e, num_steps=3).actions)
+    finally:
+        torch.randn_like = real
+    for j, o in enumerate(outs):  # every env, incl. the right-padded shorter prompts
+        torch.testing.assert_close(out_b[j:j + 1].float(), o.float(), rtol=3e-2, atol=3e-2)
