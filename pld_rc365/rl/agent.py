@@ -196,10 +196,10 @@ class ResidualSAC:
             info.update(ainfo, actor_loss=aloss.item())
         return info
 
-    def reserve_gpu_memory(self) -> None:
+    def reserve_gpu_memory(self, force: bool = False) -> None:
         """Run the largest forward/backward once on dummy data (no optimizer step, weights unchanged) so the CUDA
         allocator claims the learner's memory before the env renderers fill the GPU."""
-        if self.device.type != "cuda":
+        if self.device.type != "cuda" and not force:
             return
         a, B, rng = self._arch, self.batch, np.random.default_rng(0)
         feat = (a["n_cams"], *a["fmap_shape"])

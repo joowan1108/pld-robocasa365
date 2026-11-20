@@ -297,9 +297,7 @@ def test_entropy_is_defined_on_the_normalised_residual_so_target_is_reachable():
 
 def test_reserve_gpu_memory_is_a_noop_for_weights():
     sp = make_spec_obj(0)
-    sp.agent.device = torch.device("cuda")          # exercise the code path on CPU tensors
-    sp.agent._to_t = lambda b: {k: torch.as_tensor(v) for k, v in b.items()}
     before = {k: v.clone() for k, v in sp.agent.critic.state_dict().items()}
-    sp.agent.reserve_gpu_memory()
+    sp.agent.reserve_gpu_memory(force=True)         # same code path on CPU
     assert all(torch.equal(before[k], v) for k, v in sp.agent.critic.state_dict().items())
     assert all(p.grad is None for p in sp.agent.critic.parameters())
