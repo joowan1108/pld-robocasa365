@@ -64,7 +64,13 @@ def main():
     if eps:
         phase = f"{eps[-1]['phase']} (running)" if not phases.get(eps[-1]["phase"]) else phase
 
-    base_eps = by.get("offline", []) + by.get("warmup", [])
+    # Base-only episodes for the baselines. Offline collection stops at n successes and drops the episodes still
+    # running, and failures run 2-3x longer than successes, so its success rate is biased upwards (more so with many
+    # parallel envs). Warm-up runs a fixed number of episodes to completion: once it is finished (online episodes
+    # exist) only those are used. Before that the numbers are a partial, optimistic count.
+    warm_done = bool(by.get("online")) and bool(by.get("warmup"))
+    base_eps = by.get("warmup", []) if warm_done else by.get("offline", []) + by.get("warmup", [])
+    base_src = "warm-up" if warm_done else "offline + warm-up so far, optimistic"
     base_sr = mean(e["success"] for e in base_eps)
     # Fair baseline for the takeover SR: residual takes over only in episodes still running at T_base, which are
     # harder than average. Apply the same T_base distribution to the base-only episodes (length, success).
@@ -127,7 +133,7 @@ def main():
         if timing.get("extra", {}).get("offline"):
             o = timing["extra"]["offline"]
             print(f"offline      : {o['successes']}/{o['episodes']} successes, mean success length {o.get('mean_success_length')}")
-        print(f"base SR      : {base_sr if base_sr is None else round(base_sr, 3)}  (offline + warm-up, base policy only, {len(base_eps)} eps)")
+        print(f"base SR      : {base_sr if base_sr is None else round(base_sr, 3)}  ({base_src}; base policy only, {len(base_eps)} eps)")
         if fair is not None:
             print(f"fair baseline: {fair:.3f}  (base-only SR among episodes still running at T_base ~ U[0, alpha*T]; "
                   f"compare with the takeover rolling SR)")
