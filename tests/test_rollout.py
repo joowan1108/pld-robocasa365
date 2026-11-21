@@ -518,3 +518,35 @@ def test_actor_accepts_precomputed_encoding():
     a1, _ = ag.actor(f, p, ab, 0.1, deterministic=True)
     a2, _ = ag.actor(None, None, None, 0.1, deterministic=True, z=ag.actor.encoder(f, p, ab))
     assert torch.equal(a1, a2)
+
+
+def test_per_dimension_residual_bound():
+    """residual.xi_scale: |a_delta_j| <= xi * xi_scale_j, the critic's residual input stays in [-1, 1] per dim, and
+    the per-episode statistics count 'at bound' against each dim's own bound."""
+    import torch
+    from pld_rc365.rl.agent import ResidualSAC
+    from pld_rc365.rl.networks import combine
+    rl = {"discount": 0.99, "tau": 0.005, "batch_size": 4, "target_entropy_scale": 0.5, "hidden_dim": 16,
+          "latent_dim": 8, "num_spatial_features": 2, "num_q": 2, "lr": 3e-4, "init_temperature": 1.0,
+          "critic_action": "residual"}
+    scale = [1, 1, 1, 0.25, 0.25, 0.25, 1]
+    ag = ResidualSAC(rl, {"dims": 7, "xi": 0.1, "xi_schedule": "constant", "xi_scale": scale}, (4, 2, 2), 2, device="cpu")
+    f, p, ab = torch.randn(64, 2, 4, 2, 2) * 50, torch.randn(64, 16) * 50, torch.zeros(64, 12)   # saturate tanh
+    a_d, _ = ag.actor(f, p, ab, 0.1)
+    bound = 0.1 * torch.tensor(scale)
+    assert torch.all(a_d.abs() <= bound + 1e-7)
+    assert a_d.abs()[:, 3:6].max() <= 0.025 + 1e-7 and a_d.abs()[:, :3].max() > 0.05
+    qa = ag._qa(ab, combine(ab, a_d, 7))
+    assert qa.abs().max() <= 1 + 1e-5 and qa.abs()[:, 3:6].max() > 0.5       # rotation input uses its own scale
+    import copy
+    assert torch.equal(copy.deepcopy(ag.actor).xi_scale, ag.actor.xi_scale)   # the collector copy keeps it
+    ag.init_actor()
+    assert torch.allclose(ag.actor.xi_scale, torch.tensor(scale))             # survives the post-Cal-QL re-init
+    ag1 = ResidualSAC(rl, {"dims": 7, "xi": 0.1, "xi_schedule": "constant"}, (4, 2, 2), 2, device="cpu")
+    assert torch.equal(ag1.actor.xi_scale, torch.ones(7))                     # default: one bound for all dims
+    # runner statistics
+    runner, venv, base, specs = make_runner(num_envs=1, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    specs[0].agent.xi_scale_np = np.asarray(scale, np.float32)
+    res = run_n(runner, [EpisodeSpec(seed=1, mode="pld", t_base=0, store="online")], 1)[0]
+    r = res.extra["residual"]
+    np.testing.assert_allclose(r["xi_dim"], [x * r["xi"] for x in scale], atol=1e-6)

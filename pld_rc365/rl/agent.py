@@ -55,7 +55,14 @@ class ResidualSAC:
         self.critic_action = str(rl.get("critic_action", "total"))
         if self.critic_action not in ("total", "residual"):
             raise ValueError(f"rl.critic_action must be total|residual, got {self.critic_action!r}")
-        self.res_scale = max(float(residual["xi"]), 1e-8)
+        # residual.xi_scale: per-dimension multiplier of xi (e.g. smaller bound on the rotation dims, whose VLA
+        # actions are ~4x smaller than the position ones). |a_delta_j| <= xi * xi_scale_j.
+        sc = residual.get("xi_scale")
+        self.xi_scale_np = np.ones(self.act_dim, np.float32) if sc is None else np.asarray(sc, np.float32)
+        if self.xi_scale_np.shape != (self.act_dim,) or (self.xi_scale_np <= 0).any():
+            raise ValueError(f"residual.xi_scale must be {self.act_dim} positive numbers, got {sc!r}")
+        self.xi_scale = torch.as_tensor(self.xi_scale_np, device=self.device)
+        self.res_scale = (float(residual["xi"]) * self.xi_scale).clamp_min(1e-8)   # critic_action=residual input scale
         critic_base = base_dim if (bool(rl.get("critic_uses_a_b", False)) or self.critic_action == "residual") else 0
         self._arch = dict(fmap_shape=fmap_shape, n_cams=n_cams, proprio_dim=proprio_dim, base_dim=base_dim,
                           critic_base_dim=critic_base, critic_action=self.critic_action)
@@ -77,6 +84,7 @@ class ResidualSAC:
     def init_actor(self):
         """Random (re-)initialisation of pi_delta and the temperature (Alg. 1: after critic pre-training)."""
         self.actor = ResidualActor(self._make_encoder(), self.act_dim, self.rl["hidden_dim"]).to(self.device)
+        self.actor.xi_scale.copy_(self.xi_scale)
         self.actor_opt = torch.optim.AdamW(self.actor.parameters(), lr=self.rl["lr"])
         self.log_alpha = torch.tensor(math.log(self.rl["init_temperature"]), device=self.device, requires_grad=True)
         self.alpha_opt = torch.optim.AdamW([self.log_alpha], lr=self.rl["lr"])
@@ -193,7 +201,7 @@ class ResidualSAC:
             a_rand = torch.rand(B * n, d, device=self.device) * 2 - 1
             log_dens_rand = -d * math.log(2.0)
         else:
-            a_rand = combine(ab, (torch.rand(B * n, d, device=self.device) * 2 - 1) * xi, d)
+            a_rand = combine(ab, (torch.rand(B * n, d, device=self.device) * 2 - 1) * xi * self.xi_scale, d)
             log_dens_rand = -d * math.log(2 * xi)
         q_rand = self.critic(None, None, None, self._qa(ab, a_rand), z=zr)
         to_abar = -d * math.log(max(xi, 1e-8))

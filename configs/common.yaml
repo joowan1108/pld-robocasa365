@@ -30,6 +30,15 @@ residual:
                              # std 0.32-0.37 / 0.09-0.10). With a linear ramp to 0.5 the learned residual was 2-4x the
                              # VLA action on position and 4-10x on rotation, 36-57% at the bound, and takeover SR fell
                              # from a 0.62 base-only baseline to 0.14 (XR1 x CoffeeSetupMug, first run). Chosen: 0.1.
+  xi_scale: [1, 1, 1, 0.25, 0.25, 0.25, 1]
+                             # per-dimension multiplier of xi (dx dy dz, rx ry rz, gripper): rotation bound = 0.025.
+                             # The VLA's rotation actions are ~4x smaller than its position actions here (|a| 0.03-0.04
+                             # vs 0.11-0.18; RC365 demo std 0.09-0.10 vs 0.32-0.37), so one xi for all dims let the
+                             # learned residual push rotation as hard as the VLA itself (per-episode mean push 0.025 =
+                             # 70-90% of the VLA's rotation action vs ~20% for position; runs up to 2026-11-21, all 1).
+                             # The paper does not say in which action space xi is defined; the unofficial
+                             # implementation adds the residual in q01/q99-normalised action space, which has the
+                             # same effect. null = same bound for every dim.
   xi_schedule: constant      # constant | linear (paper: "tuned by a scheduler", form not given)
   xi_start: 0.1              # only for linear
   xi_ramp_steps: 50000       # only for linear: residual-acted online steps to reach xi

@@ -115,10 +115,13 @@ class ResidualActor(nn.Module):
         self.encoder = encoder
         self.trunk = mlp(encoder.out_dim, hidden, 2 * act_dim)
         self.act_dim = act_dim
+        # per-dimension multiplier of the bound xi (residual.xi_scale); set by the agent, not part of checkpoints
+        self.register_buffer("xi_scale", torch.ones(act_dim), persistent=False)
 
     def forward(self, feats, proprio, a_base, xi: float, deterministic: bool = False, with_logprob: bool = True,
                 z: torch.Tensor | None = None):
-        """Returns a_delta = xi * tanh(u) in [-xi, xi]^d and log pi of the *normalised* residual tanh(u) in [-1, 1]^d.
+        """Returns a_delta = xi * xi_scale * tanh(u) (|a_delta_j| <= xi * xi_scale_j) and log pi of the *normalised*
+        residual tanh(u) in [-1, 1]^d.
 
         The density is deliberately not divided by xi^d: SAC's target entropy (-act_dim/2) assumes a unit action
         box, and with the xi schedule the maximum entropy of a_delta itself is d*log(2*xi) (-11.3 at xi=0.1), below
@@ -130,7 +133,7 @@ class ResidualActor(nn.Module):
         std = log_std.exp()
         u = mu if deterministic else mu + std * torch.randn_like(mu)
         y = torch.tanh(u)
-        a_delta = xi * y
+        a_delta = xi * self.xi_scale * y
         logp = None
         if with_logprob:
             logp = (-0.5 * ((u - mu) / std) ** 2 - log_std - 0.5 * math.log(2 * math.pi)).sum(-1)

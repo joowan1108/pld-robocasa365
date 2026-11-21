@@ -144,9 +144,10 @@ def main():
             names = ["dx", "dy", "dz", "rx", "ry", "rz", "grip"]
             avg = lambda key: [mean(x[key][j] for x in rec) for j in range(len(names))]  # noqa: E731
             print(f"residual (last {len(rec)} takeover eps, xi now {rec[-1]['xi']:.3f}):")
-            print("   dim   mean  mean|.|  at_bound  |VLA a|")
+            xd = rec[-1].get("xi_dim") or [rec[-1]["xi"]] * len(names)
+            print("   dim   mean  mean|.|  at_bound  |VLA a|  bound")
             for j, nm in enumerate(names):
-                print(f"  {nm:>4} {avg('mean')[j]:+.3f}  {avg('mean_abs')[j]:.3f}    {avg('at_bound')[j]:.2f}     {avg('base_abs')[j]:.3f}")
+                print(f"  {nm:>4} {avg('mean')[j]:+.3f}  {avg('mean_abs')[j]:.3f}    {avg('at_bound')[j]:.2f}     {avg('base_abs')[j]:.3f}   {xd[j]:.3f}")
         if calql_l:
             c = calql_l[-1]
             print(f"Cal-QL       : last step {c.get('step')} critic {c.get('critic_loss')} cql_gap {c.get('cql_gap')} Q {c.get('q')}")

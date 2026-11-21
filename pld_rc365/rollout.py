@@ -88,6 +88,7 @@ class _EnvState:
     res_bound: np.ndarray | None = None        # count of |a_delta| > 0.95 xi per dim
     base_abs: np.ndarray | None = None         # sum of |a_b[:d]| over the same steps (VLA action scale)
     res_xi: float | None = None
+    res_xi_dim: np.ndarray | None = None       # per-dim bound xi * xi_scale
     t0: float = field(default_factory=time.time)
 
 
@@ -264,6 +265,7 @@ class Runner:
                         deterministic=det,
                     )
                 xi_now = float(sp.agent.xi)
+                xi_dim = xi_now * np.asarray(getattr(sp.agent, "xi_scale_np", 1.0)) * np.ones(self.d)   # bound per dim
                 for i, ad in zip(idxs, a_d):
                     s_ = states[i]
                     if s_.res_sum is None:
@@ -272,9 +274,10 @@ class Runner:
                     s_.res_n += 1
                     s_.res_sum += ad
                     s_.res_abs += np.abs(ad)
-                    s_.res_bound += np.abs(ad) > 0.95 * xi_now
+                    s_.res_bound += np.abs(ad) > 0.95 * xi_dim
                     s_.base_abs += np.abs(a_b[i][: self.d])
                     s_.res_xi = xi_now
+                    s_.res_xi_dim = xi_dim
                     ab = np.clip(a_b[i][: self.d] + ad, -1.0, 1.0)
                     act = a_b[i].copy()
                     act[: self.d] = ab
@@ -358,7 +361,8 @@ class Runner:
         r = lambda x: [round(float(v), 4) for v in x]  # noqa: E731
         return {"steps": s.res_n, "xi": s.res_xi, "mean": r(s.res_sum / n), "mean_abs": r(s.res_abs / n),
                 "at_bound": r(s.res_bound / n), "base_abs": r(s.base_abs / n),
-                "abs_over_xi": round(float((s.res_abs / n).mean() / max(s.res_xi, 1e-8)), 4),
+                "xi_dim": r(s.res_xi_dim),
+                "abs_over_xi": round(float(((s.res_abs / n) / np.maximum(s.res_xi_dim, 1e-8)).mean()), 4),
                 "abs_over_base": round(float((s.res_abs / n)[:6].sum() / max((s.base_abs / n)[:6].sum(), 1e-8)), 4)}
 
     def _check_step(self, i, popped, a_b, action, a_bar, pkt):

@@ -8,7 +8,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CMD="${1:?start|stop}"; MODEL="${2:?xr1|rldx}"
 LOGS="$REPO/runs/logs"; mkdir -p "$LOGS"
-if [[ $MODEL == xr1 ]]; then BASE_PORT=22000; else BASE_PORT=21000; fi
+# PLD_XR1_PORT / PLD_RLDX_PORT override the base port (shared servers); pass the same value as base.port
+if [[ $MODEL == xr1 ]]; then BASE_PORT="${PLD_XR1_PORT:-22000}"; else BASE_PORT="${PLD_RLDX_PORT:-21000}"; fi
 
 stop_pidfile() {
   local f="$1"
