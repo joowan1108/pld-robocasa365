@@ -33,7 +33,9 @@ residual:
   xi_schedule: constant      # constant | linear (paper: "tuned by a scheduler", form not given)
   xi_start: 0.1              # only for linear
   xi_ramp_steps: 50000       # only for linear: residual-acted online steps to reach xi
-  image_size: 128
+  image_size: 256            # residual actor/critic input. 256 = the rendered camera frame as it is (no resampling):
+                             # ResNet-10 feature map 8x8 per camera. The paper gives no resolution. 128 (4x4 map, the
+                             # frame downsampled 2x) was used for every run before 2026-11-21.
   cameras: [robot0_agentview_left, robot0_eye_in_hand]
 
 rl:                          # Table 5

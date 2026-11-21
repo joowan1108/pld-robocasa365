@@ -53,6 +53,8 @@ def offline_cache_dir(cfg: dict, spec, n_off: int) -> Path:
     key = f"L{spec.layout_id}_S{spec.style_id}_n{n_off}_e{int(cfg['base']['exec_steps'])}"
     if init_seed_pool(cfg):
         key += f"_p{len(init_seed_pool(cfg))}"
+    if int(cfg["residual"]["image_size"]) != 128:   # buffers hold encoder features of the residual images; 128 was
+        key += f"_i{int(cfg['residual']['image_size'])}"   # the only size before 2026-11-21 (keys without a suffix)
     return root / cfg["model_name"] / cfg["task_name"] / "offline_cache" / key
 
 

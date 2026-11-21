@@ -55,7 +55,7 @@ class ReplayBuffer:
     def sample(self, n: int, rng: np.random.Generator) -> dict[str, np.ndarray]:
         with self.lock:
             idx = rng.integers(0, self.size, size=n)
-            return {k: v[idx].copy() for k, v in self.data.items()}
+            return {k: v[idx] for k, v in self.data.items()}   # fancy indexing already copies
 
     def __len__(self):
         return self.size

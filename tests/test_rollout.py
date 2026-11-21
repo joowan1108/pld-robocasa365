@@ -448,3 +448,28 @@ def test_critic_action_residual_separates_vla_action_from_residual():
     assert np.isfinite(info["critic_loss"])
     info = ag.update(b)
     assert np.isfinite(info["critic_loss"])
+
+
+def test_offline_cache_key_depends_on_residual_image_size():
+    """Buffers store encoder features of the residual images, so a different image size needs its own cache."""
+    from types import SimpleNamespace
+    from pld_rc365.stage1_train import offline_cache_dir
+    spec = SimpleNamespace(layout_id=11, style_id=34)
+    cfg = {"paths": {"runs_root": "runs"}, "model_name": "xr1", "task_name": "T", "base": {"exec_steps": 16},
+           "stage1": {"init_seed_pool": 0}, "seeds": {"offline": 0}, "residual": {"image_size": 128}}
+    d128 = offline_cache_dir(cfg, spec, 50)
+    cfg["residual"]["image_size"] = 256
+    d256 = offline_cache_dir(cfg, spec, 50)
+    assert d128.name == "L11_S34_n50_e16" and d256.name == "L11_S34_n50_e16_i256"
+
+
+def test_actor_accepts_precomputed_encoding():
+    import torch
+    from pld_rc365.rl.agent import ResidualSAC
+    rl = {"discount": 0.99, "tau": 0.005, "batch_size": 4, "target_entropy_scale": 0.5, "hidden_dim": 16,
+          "latent_dim": 8, "num_spatial_features": 2, "num_q": 2, "lr": 3e-4, "init_temperature": 1.0}
+    ag = ResidualSAC(rl, {"dims": 7, "xi": 0.1, "xi_schedule": "constant"}, (4, 8, 8), 2, device="cpu")   # 8x8 map
+    f, p, ab = torch.randn(3, 2, 4, 8, 8), torch.randn(3, 16), torch.randn(3, 12)
+    a1, _ = ag.actor(f, p, ab, 0.1, deterministic=True)
+    a2, _ = ag.actor(None, None, None, 0.1, deterministic=True, z=ag.actor.encoder(f, p, ab))
+    assert torch.equal(a1, a2)

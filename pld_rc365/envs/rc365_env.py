@@ -107,9 +107,11 @@ class RC365Env:
         images = {c: np.ascontiguousarray(raw[f"{c}_image"][::-1]) for c in CAMERAS}
         state = {k: np.asarray(raw[v], dtype=np.float32).reshape(-1) for k, v in STATE_KEYS.items()}
         rs = self.spec.residual_size
-        res_images = np.stack(
-            [cv2.resize(images[c], (rs, rs), interpolation=cv2.INTER_AREA) for c in self.spec.residual_cameras]
-        )
+        # residual_size == camera size: the residual policy sees the rendered frame as it is (no resampling)
+        res_images = np.stack([
+            images[c] if images[c].shape[:2] == (rs, rs) else cv2.resize(images[c], (rs, rs), interpolation=cv2.INTER_AREA)
+            for c in self.spec.residual_cameras
+        ])
         return {
             "images": images,
             "state": state,

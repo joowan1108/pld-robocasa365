@@ -161,7 +161,9 @@ class ResidualSAC:
         B = z.shape[0]
         zr, ab = rep(z), rep(b["a_b"])
         with torch.no_grad():
-            a_pi, _ = self.actor(rep(b["feat"]), rep(b["proprio"]), ab, xi)
+            # encode each state once and repeat the encoding (not the feature maps) for the n action samples
+            za = self.actor.encoder(b["feat"], b["proprio"], b["a_b"])
+            a_pi, _ = self.actor(None, None, None, xi, z=rep(za))
         q_pi = self.critic(None, None, None, self._qa(ab, combine(ab, a_pi, self.act_dim)), z=zr)   # (num_q, B*n)
         mc = rep(b["mc_return"])[None]
         info = {"q_pi": q_pi.mean().item(), "mc_return": b["mc_return"].mean().item(),
