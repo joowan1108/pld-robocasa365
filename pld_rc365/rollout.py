@@ -287,6 +287,16 @@ class Runner:
             stores = {i: self._stores_now(states[i]) for i in active}
             acted_residual = {i for _, idxs in groups.items() for i in idxs}
             out = self.venv.step(actions)
+            dead = [i for i in active if out[i].get("_dead")]
+            if dead:   # the worker hung or died and was replaced (VecEnv watchdog): drop these episodes
+                for i in dead:
+                    s = states.pop(i)
+                    self.stats["dead_envs"] = self.stats.get("dead_envs", 0) + 1
+                    print(f"[runner] env {i}: worker replaced, episode dropped (seed {s.spec.seed}, t={s.t}, "
+                          f"{s.n_stored} transitions already stored)", flush=True)
+                active = [i for i in active if i not in dead]
+                for i in dead:
+                    start(i)
             self.stats["env_steps"] += len(active)
             for i in active:
                 popped = self.base.pop(i)

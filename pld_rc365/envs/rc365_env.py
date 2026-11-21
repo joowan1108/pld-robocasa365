@@ -267,61 +267,110 @@ def _worker(remote, parent_remote, spec_kwargs: dict, record_root: str | None, g
 
 
 class VecEnv:
-    """N RC365Env workers in subprocesses. Synchronous step over the subset of envs given."""
+    """N RC365Env workers in subprocesses. Synchronous step over the subset of envs given.
+
+    Watchdog: a worker that does not answer a step within `step_timeout` seconds (or a reset within `reset_timeout`)
+    is killed and replaced by a fresh one. step() then returns {"_dead": True} for that env and the caller drops the
+    episode. Seen on bw2 (B200, 32 envs): one worker spun at 100% CPU inside env.step for 80 min and blocked the whole
+    run; the cause is unknown (no ptrace there) and it is rare (the twin run with the same seeds did not hit it)."""
 
     def __init__(self, spec: EnvSpec, num_envs: int, record_root: str | None = None, gl: str = "egl",
-                 egl_devices: list[str] | None = None):
+                 egl_devices: list[str] | None = None, step_timeout: float | None = None,
+                 reset_timeout: float | None = None):
         import multiprocessing as mp
         from dataclasses import asdict
 
-        import os
-
-        from ..utils.threads import _VARS
-
-        ctx = mp.get_context("spawn")
+        self._ctx = mp.get_context("spawn")
         self.num_envs = num_envs
-        saved = {v: os.environ.get(v) for v in _VARS}
-        for v in _VARS:  # children inherit the environment at spawn: 1 thread each
-            os.environ[v] = "1"
-        self.remotes, self.procs = [], []
+        self._args = (asdict(spec), record_root, gl)
+        self._egl = egl_devices
+        self.step_timeout = float(step_timeout or os.environ.get("PLD_ENV_STEP_TIMEOUT", 300))
+        self.reset_timeout = float(reset_timeout or os.environ.get("PLD_ENV_RESET_TIMEOUT", 900))
+        self.restarts = 0
+        self.remotes: list = [None] * num_envs
+        self.procs: list = [None] * num_envs
         for i in range(num_envs):
-            remote, work_remote = ctx.Pipe()
-            dev = egl_devices[i % len(egl_devices)] if egl_devices else None
-            p = ctx.Process(target=_worker, args=(work_remote, remote, asdict(spec), record_root, gl, dev), daemon=True)
-            p.start()
-            work_remote.close()
-            self.remotes.append(remote)
-            self.procs.append(p)
-        for v, val in saved.items():
-            if val is None:
-                os.environ.pop(v, None)
-            else:
-                os.environ[v] = val
+            self._spawn(i)
         self.remotes[0].send(("horizon", None))
         self.horizon = self.remotes[0].recv()
 
+    def _spawn(self, i: int) -> None:
+        from ..utils.threads import _VARS
+
+        saved = {v: os.environ.get(v) for v in _VARS}
+        for v in _VARS:  # children inherit the environment at spawn: 1 thread each
+            os.environ[v] = "1"
+        try:
+            remote, work_remote = self._ctx.Pipe()
+            dev = self._egl[i % len(self._egl)] if self._egl else None
+            spec_kwargs, record_root, gl = self._args
+            p = self._ctx.Process(target=_worker, args=(work_remote, remote, spec_kwargs, record_root, gl, dev), daemon=True)
+            p.start()
+            work_remote.close()
+        finally:
+            for v, val in saved.items():
+                if val is None:
+                    os.environ.pop(v, None)
+                else:
+                    os.environ[v] = val
+        self.remotes[i], self.procs[i] = remote, p
+
+    def _restart(self, i: int, why: str) -> None:
+        p = self.procs[i]
+        print(f"[vecenv] env {i}: {why} -- killing worker pid {p.pid} and starting a new one", flush=True)
+        p.kill()
+        p.join(timeout=30)
+        try:
+            self.remotes[i].close()
+        except Exception:  # noqa: BLE001
+            pass
+        self.restarts += 1
+        self._spawn(i)
+
+    def _recv(self, i: int, timeout: float, what: str):
+        """The worker's answer, or None after restarting a worker that missed the deadline or died."""
+        r = self.remotes[i]
+        try:
+            if r.poll(timeout):
+                return r.recv()
+            self._restart(i, f"no answer to {what} within {timeout:.0f} s")
+        except (EOFError, OSError, ConnectionError) as e:
+            self._restart(i, f"worker gone during {what} ({type(e).__name__})")
+        return None
+
     def reset(self, idx: int, seed: int, record: bool = False) -> dict:
-        self.remotes[idx].send(("reset", {"seed": seed, "record": record}))
-        return self.remotes[idx].recv()
+        for attempt in range(2):
+            self.remotes[idx].send(("reset", {"seed": seed, "record": record}))
+            out = self._recv(idx, self.reset_timeout, f"reset(seed={seed})")
+            if out is not None:
+                return out
+        raise RuntimeError(f"env {idx}: reset(seed={seed}) failed twice")
 
     def step(self, actions: dict[int, np.ndarray]) -> dict[int, dict]:
         for i, a in actions.items():
             self.remotes[i].send(("step", a))
-        return {i: self.remotes[i].recv() for i in actions}
+        out = {}
+        for i in actions:
+            r = self._recv(i, self.step_timeout, "step")
+            out[i] = {"_dead": True} if r is None else r
+        return out
 
     def finish(self, idx: int, keep: bool, extra_meta: dict | None = None) -> str | None:
         self.remotes[idx].send(("finish", {"keep": keep, "extra_meta": extra_meta}))
-        return self.remotes[idx].recv()
+        return self._recv(idx, self.reset_timeout, "finish")
 
     def close(self):
         for r in self.remotes:
             try:
                 r.send(("close", None))
-                r.recv()
+                if r.poll(30):
+                    r.recv()
             except Exception:  # noqa: BLE001
                 pass
         for p in self.procs:
             p.join(timeout=10)
+            if p.is_alive():
+                p.kill()
 
 
 def make_spec(cfg: dict, scene: str = "fixed", task: str | None = None) -> EnvSpec:

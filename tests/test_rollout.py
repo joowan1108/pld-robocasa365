@@ -550,3 +550,58 @@ def test_per_dimension_residual_bound():
     res = run_n(runner, [EpisodeSpec(seed=1, mode="pld", t_base=0, store="online")], 1)[0]
     r = res.extra["residual"]
     np.testing.assert_allclose(r["xi_dim"], [x * r["xi"] for x in scale], atol=1e-6)
+
+
+def test_vecenv_watchdog_replaces_a_hung_worker():
+    from pld_rc365.envs.rc365_env import VecEnv
+
+    class Conn:
+        def __init__(self, answers):
+            self.answers, self.sent, self.closed = list(answers), [], False
+        def send(self, x):
+            self.sent.append(x)
+        def poll(self, timeout):
+            return bool(self.answers)
+        def recv(self):
+            return self.answers.pop(0)
+        def close(self):
+            self.closed = True
+
+    class Proc:
+        pid, killed = 123, False
+        def kill(self):
+            self.killed = True
+        def join(self, timeout=None):
+            pass
+
+    v = object.__new__(VecEnv)
+    v.num_envs, v.step_timeout, v.reset_timeout, v.restarts = 2, 0.01, 0.01, 0
+    hung, ok = Conn([]), Conn([{"t": 1}])
+    v.remotes, v.procs = [ok, hung], [Proc(), Proc()]
+    old_proc = v.procs[1]
+    fresh = Conn([{"t": 0, "fresh": True}])
+    v._spawn = lambda i: (v.remotes.__setitem__(i, fresh), v.procs.__setitem__(i, Proc()))
+    out = v.step({0: 0, 1: 0})
+    assert out[0] == {"t": 1} and out[1] == {"_dead": True}
+    assert old_proc.killed and hung.closed and v.restarts == 1 and v.remotes[1] is fresh
+    assert v.reset(1, seed=5) == {"t": 0, "fresh": True}                  # the new worker serves the next reset
+
+
+def test_runner_drops_the_episode_of_a_replaced_worker():
+    runner, venv, base, specs = make_runner(num_envs=2, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    real_step, calls = venv.step, {"n": 0}
+
+    def step(actions):
+        out = real_step(actions)
+        calls["n"] += 1
+        if calls["n"] == 5 and 1 in out:     # env 1 "hangs" once
+            out[1] = {"_dead": True}
+        return out
+    venv.step = step
+    it = iter([EpisodeSpec(seed=s, mode="base", store="online") for s in (1, 3, 5)])
+    res = []
+    runner.run(lambda: next(it, None), lambda r: res.append(r) or False)
+    assert runner.stats["dead_envs"] == 1
+    assert sorted(r.spec.seed for r in res) == [1, 5]   # the dropped episode (seed 3) reports no result
+    # complete transitions stored before the hang stay (real experience); the one waiting for next_a_b is dropped
+    assert specs[0].online.size == 12 + 12 + 4                # 4 = n_stored reported for the dropped episode
