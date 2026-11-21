@@ -50,9 +50,15 @@ class ResidualSAC:
                                # warm-up / base-only steps do not advance it)
         # Paper Eq. 2: critic Q(s, a_bar) -- a_b goes to the actor only. critic_uses_a_b=true gives Q(s, a_b, a_bar)
         # (used by the first runs, before this was checked against the paper).
-        critic_base = base_dim if bool(rl.get("critic_uses_a_b", False)) else 0
+        # rl.critic_action = residual gives Q(s, a_b, a_delta): the VLA action is part of the critic's state and the
+        # action input is the applied residual alone (scaled to [-1, 1]). Deviates from Eq. 2; see `_qa`.
+        self.critic_action = str(rl.get("critic_action", "total"))
+        if self.critic_action not in ("total", "residual"):
+            raise ValueError(f"rl.critic_action must be total|residual, got {self.critic_action!r}")
+        self.res_scale = max(float(residual["xi"]), 1e-8)
+        critic_base = base_dim if (bool(rl.get("critic_uses_a_b", False)) or self.critic_action == "residual") else 0
         self._arch = dict(fmap_shape=fmap_shape, n_cams=n_cams, proprio_dim=proprio_dim, base_dim=base_dim,
-                          critic_base_dim=critic_base)
+                          critic_base_dim=critic_base, critic_action=self.critic_action)
         torch.manual_seed(seed)
         self.rng = np.random.default_rng(seed)
 
@@ -83,6 +89,17 @@ class ResidualSAC:
     def _to_t(self, b: dict) -> dict[str, torch.Tensor]:
         return {k: torch.as_tensor(v, device=self.device) for k, v in b.items()}
 
+    def _qa(self, a_b: torch.Tensor, a_bar: torch.Tensor) -> torch.Tensor:
+        """Action input of the critic for the executed arm action a_bar taken on top of the base action a_b.
+
+        total    : a_bar itself -- Q(s, a_bar), paper Eq. 2.
+        residual : (a_bar - clip(a_b)) / xi, the residual that was actually applied, in [-1, 1]; a_b enters through
+                   the critic's encoder, so the critic is Q(s, a_b, a_delta). Base-only data (offline buffer, warm-up)
+                   has exactly 0 here, so the action input cannot carry information about what the VLA is doing."""
+        if self.critic_action == "total":
+            return a_bar
+        return (a_bar - a_b[..., : self.act_dim].clamp(-1.0, 1.0)) / self.res_scale
+
     def _step(self, opt, loss, params):
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -95,12 +112,12 @@ class ResidualSAC:
             n = int(self.rl.get("otf_samples", 1))
             if n <= 1:
                 a_d, logp = self.actor(nf, npp, nab, xi)
-                q_next = self.critic_targ(nf, npp, nab, combine(nab, a_d, self.act_dim)).min(0).values
+                q_next = self.critic_targ(nf, npp, nab, self._qa(nab, combine(nab, a_d, self.act_dim))).min(0).values
             else:  # on-the-fly: sample n residuals at the fixed base action, back up the max
                 B = nf.shape[0]
                 rep = lambda x: x.repeat_interleave(n, 0)  # noqa: E731
                 a_d, logp = self.actor(rep(nf), rep(npp), rep(nab), xi)
-                q = self.critic_targ(rep(nf), rep(npp), rep(nab), combine(rep(nab), a_d, self.act_dim)).min(0).values
+                q = self.critic_targ(rep(nf), rep(npp), rep(nab), self._qa(rep(nab), combine(rep(nab), a_d, self.act_dim))).min(0).values
                 q, arg = q.view(B, n).max(1)
                 logp = logp.view(B, n).gather(1, arg[:, None]).squeeze(1)
                 q_next = q
@@ -118,7 +135,7 @@ class ResidualSAC:
     def critic_loss(self, b, xi, calql_alpha: float = 0.0):
         y = self._td_target(b, xi)
         z = self.critic.encoder(b["feat"], b["proprio"], b["a_b"])
-        q = self.critic(None, None, None, b["a_bar"], z=z)  # (num_q, B)
+        q = self.critic(None, None, None, self._qa(b["a_b"], b["a_bar"]), z=z)  # (num_q, B)
         loss = sum(F.mse_loss(qi, y) for qi in q)
         info = {"q": q.mean().item(), "td_target": y.mean().item()}
         if calql_alpha > 0:
@@ -145,7 +162,7 @@ class ResidualSAC:
         zr, ab = rep(z), rep(b["a_b"])
         with torch.no_grad():
             a_pi, _ = self.actor(rep(b["feat"]), rep(b["proprio"]), ab, xi)
-        q_pi = self.critic(None, None, None, combine(ab, a_pi, self.act_dim), z=zr)   # (num_q, B*n)
+        q_pi = self.critic(None, None, None, self._qa(ab, combine(ab, a_pi, self.act_dim)), z=zr)   # (num_q, B*n)
         mc = rep(b["mc_return"])[None]
         info = {"q_pi": q_pi.mean().item(), "mc_return": b["mc_return"].mean().item(),
                 "calib_binds": (q_pi < mc).float().mean().item()}
@@ -176,14 +193,14 @@ class ResidualSAC:
         else:
             a_rand = combine(ab, (torch.rand(B * n, d, device=self.device) * 2 - 1) * xi, d)
             log_dens_rand = -d * math.log(2 * xi)
-        q_rand = self.critic(None, None, None, a_rand, z=zr)
+        q_rand = self.critic(None, None, None, self._qa(ab, a_rand), z=zr)
         to_abar = -d * math.log(max(xi, 1e-8))
         with torch.no_grad():
             a_pi, logp_pi = self.actor(rep(b["feat"]), rep(b["proprio"]), ab, xi)
             a_nx, logp_nx = self.actor(rep(b["next_feat"]), rep(b["next_proprio"]), rep(b["next_a_b"]), xi)
             logp_pi, logp_nx = logp_pi + to_abar, logp_nx + to_abar
-        q_pi = self.critic(None, None, None, combine(ab, a_pi, d), z=zr)
-        q_nx = self.critic(None, None, None, combine(ab, a_nx, d), z=zr)
+        q_pi = self.critic(None, None, None, self._qa(ab, combine(ab, a_pi, d)), z=zr)
+        q_nx = self.critic(None, None, None, self._qa(ab, combine(ab, a_nx, d)), z=zr)
         mc = rep(b["mc_return"])[None]
         info = {"q_pi": q_pi.mean().item(), "q_rand": q_rand.mean().item(), "mc_return": b["mc_return"].mean().item(),
                 "calib_binds": (q_pi < mc).float().mean().item()}
@@ -203,7 +220,7 @@ class ResidualSAC:
         a_d, logp = self.actor(b["feat"], b["proprio"], b["a_b"], xi)
         with torch.no_grad():
             z = self.critic.encoder(b["feat"], b["proprio"], b["a_b"])
-        q = self.critic(None, None, None, combine(b["a_b"], a_d, self.act_dim), z=z).min(0).values
+        q = self.critic(None, None, None, self._qa(b["a_b"], combine(b["a_b"], a_d, self.act_dim)), z=z).min(0).values
         alpha = self.log_alpha.exp().detach()
         loss = (alpha * logp - q).mean()
         alpha_loss = -(self.log_alpha * (logp.detach() + self.target_entropy)).mean()

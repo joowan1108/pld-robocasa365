@@ -54,6 +54,8 @@ rl:                          # Table 5
   latent_dim: 256
   num_spatial_features: 8    # SERL SpatialLearnedEmbeddings
   critic_uses_a_b: false     # paper Eq. 2: critic Q(s, a_bar), a_b is an input of the actor only. true = Q(s, a_b, a_bar)
+  critic_action: total       # total = Q(s, a_bar) (paper Eq. 2). residual = Q(s, a_b, a_delta): a_b is critic state, the action
+                             # input is the applied residual / xi (base-only data has exactly 0). Deviates from the paper.
                              # (the first three XR1 runs; must be true to load their checkpoints)
   backup_entropy: false      # SERL default
   timeout_terminal: true     # time limit without success = failed episode, terminal for the critic (paper 2.1: "an

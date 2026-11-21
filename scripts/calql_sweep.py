@@ -36,11 +36,11 @@ def evaluate(agent: ResidualSAC, ev: dict) -> dict:
     b = agent._to_t(ev)
     xi, d = agent.xi, agent.act_dim
     z = agent.critic.encoder(b["feat"], b["proprio"], b["a_b"])
-    q_data = agent.critic(None, None, None, b["a_bar"], z=z).min(0).values
+    q_data = agent.critic(None, None, None, agent._qa(b["a_b"], b["a_bar"]), z=z).min(0).values
     a_pi, _ = agent.actor(b["feat"], b["proprio"], b["a_b"], xi)
-    q_pi = agent.critic(None, None, None, combine(b["a_b"], a_pi, d), z=z).min(0).values
+    q_pi = agent.critic(None, None, None, agent._qa(b["a_b"], combine(b["a_b"], a_pi, d)), z=z).min(0).values
     u = (torch.rand_like(a_pi) * 2 - 1) * xi
-    q_unif = agent.critic(None, None, None, combine(b["a_b"], u, d), z=z).min(0).values
+    q_unif = agent.critic(None, None, None, agent._qa(b["a_b"], combine(b["a_b"], u, d)), z=z).min(0).values
     mc = b["mc_return"]
     y = agent._td_target(b, xi)
     qd, m = q_data.cpu().numpy(), mc.cpu().numpy()

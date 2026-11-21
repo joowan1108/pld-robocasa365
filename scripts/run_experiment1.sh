@@ -7,7 +7,7 @@
 # Unattended and resumable: every step is skipped if its result file already exists, and the script stops at the
 # first step that fails to produce its result. The base-policy server is started/stopped here (never alongside SFT).
 #   source vast.env && bash scripts/run_experiment1.sh     # GPU count / env count auto-detected
-# Overrides: GPUS, REPLICAS, NUM_ENVS, ENVS_PER_GPU, PLD_SET="a.b=c ...", PLD_EGL_DEVICES
+# Overrides: GPUS, REPLICAS, NUM_ENVS, ENVS_PER_GPU, PLD_SET="a.b=c ...", PLD_EGL_DEVICES, STOP_AFTER=stage1
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"
 MODEL="${MODEL:-xr1}"
@@ -78,6 +78,9 @@ PYGATE
 if [[ ! -f $R/stage1/specialists_final.pt ]]; then
   step "stage 1"; "$PY" -m pld_rc365.stage1_train --model "$MODEL" --task "$TASK" "${SET[@]}"
 fi; need "$R/stage1/specialists_final.pt"
+if [[ ${STOP_AFTER:-} == stage1 ]]; then   # residual-RL experiments: do not go on to data collection / SFT
+  bash scripts/server.sh stop "$MODEL"; step "STOP_AFTER=stage1 -- stopping before stage 2"; exit 0
+fi
 if [[ ! -f runs/pld_data/$MODEL/${TASK}_pld${N}/lerobot/meta/info.json ]]; then
   step "stage 2"; "$PY" -m pld_rc365.stage2_collect --model "$MODEL" --task "$TASK" "${SET[@]}" "stage2.target_successes=$N"
 fi; need "runs/pld_data/$MODEL/${TASK}_pld${N}/lerobot/meta/info.json"

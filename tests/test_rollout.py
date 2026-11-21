@@ -407,3 +407,44 @@ def test_async_learner_respects_update_ratio():
         time.sleep(0.3)
         lr.stop()
         assert sp.agent.n_updates == expect, (utd, sp.agent.n_updates)
+
+
+def test_critic_action_residual_separates_vla_action_from_residual():
+    """rl.critic_action=residual: Q(s, a_b, a_delta). Base-only data has a zero action input whatever the VLA does,
+    a_b reaches the critic through the encoder, and the losses run."""
+    import numpy as np
+    import torch
+    from pld_rc365.rl.agent import ResidualSAC
+    from pld_rc365.rl.networks import combine
+    rl = {"discount": 0.99, "tau": 0.005, "batch_size": 4, "target_entropy_scale": 0.5, "hidden_dim": 16,
+          "latent_dim": 8, "num_spatial_features": 2, "num_q": 2, "lr": 3e-4, "init_temperature": 1.0, "grad_clip": 1.0,
+          "critic_action": "residual", "critic_actor_ratio": 1, "calql": {"form": "paper", "num_samples": 3}}
+    res = {"dims": 7, "xi": 0.1, "xi_schedule": "constant"}
+    ag = ResidualSAC(rl, res, (4, 2, 2), 2, device="cpu")
+    assert ag.critic.encoder.base_action_dim == 12 and ag.state_dict()["arch"]["critic_action"] == "residual"
+    g = torch.Generator().manual_seed(0)
+    a_b = torch.rand(5, 12, generator=g) * 3 - 1.5                       # includes values outside [-1, 1]
+    base_only = a_b[:, :7].clamp(-1, 1)                                   # what the rollout stores without a residual
+    assert torch.equal(ag._qa(a_b, base_only), torch.zeros(5, 7))
+    a_d = (torch.rand(5, 7, generator=g) * 2 - 1) * 0.1
+    qa = ag._qa(a_b, combine(a_b, a_d, 7))
+    assert qa.abs().max() <= 1 + 1e-5
+    inside = (a_b[:, :7].abs() < 0.9)                                     # not clipped: input is exactly a_delta / xi
+    assert torch.allclose(qa[inside], (a_d / 0.1)[inside], atol=1e-5)
+    f, p = torch.randn(5, 2, 4, 2, 2), torch.randn(5, 16)
+    q1 = ag.critic(f, p, a_b, torch.zeros(5, 7))
+    q2 = ag.critic(f, p, a_b + 0.5, torch.zeros(5, 7))
+    assert not torch.allclose(q1, q2)                                     # the VLA action is critic state
+    # paper mode is unchanged: action input is a_bar itself
+    ag0 = ResidualSAC({**rl, "critic_action": "total"}, res, (4, 2, 2), 2, device="cpu")
+    assert torch.equal(ag0._qa(a_b, base_only), base_only) and ag0.critic.encoder.base_action_dim == 0
+    rng = np.random.default_rng(0)
+    b = {"feat": rng.standard_normal((4, 2, 4, 2, 2)).astype(np.float16), "next_feat": rng.standard_normal((4, 2, 4, 2, 2)).astype(np.float16),
+         "proprio": rng.standard_normal((4, 16)).astype(np.float32), "next_proprio": rng.standard_normal((4, 16)).astype(np.float32),
+         "a_b": rng.uniform(-1, 1, (4, 12)).astype(np.float32), "next_a_b": rng.uniform(-1, 1, (4, 12)).astype(np.float32),
+         "a_bar": rng.uniform(-1, 1, (4, 7)).astype(np.float32), "reward": np.zeros(4, np.float32),
+         "done": np.zeros(4, np.float32), "mc_return": np.full(4, 0.5, np.float32)}
+    info = ag.update(b, calql_alpha=1.0)
+    assert np.isfinite(info["critic_loss"])
+    info = ag.update(b)
+    assert np.isfinite(info["critic_loss"])

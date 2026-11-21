@@ -97,7 +97,9 @@ def warmup_meta(cfg: dict, offline_src: dict) -> dict:
         "offline_cache_created": offline_src.get("created"),  # a re-collected offline buffer invalidates it
         "offline_key": {k: offline_src.get(k) for k in ("model", "task", "layout_id", "style_id", "n_successes",
                                                          "base_model_path", "fmap_shape", "n_cams")},
-        "rl": {k: v for k, v in cfg["rl"].items() if k not in WARMUP_KEY_EXCLUDE_RL},
+        # critic_action is left out at its default so warm-up caches written before the option existed still match
+        "rl": {k: v for k, v in cfg["rl"].items()
+               if k not in WARMUP_KEY_EXCLUDE_RL and not (k == "critic_action" and v == "total")},
         "residual": {k: v for k, v in cfg["residual"].items() if k not in WARMUP_KEY_EXCLUDE_RES},
         "warmup_seed_base": int(cfg["seeds"]["warmup"]),
         **({"init_seed_pool": len(init_seed_pool(cfg))} if init_seed_pool(cfg) else {}),
