@@ -23,7 +23,8 @@ import numpy as np
 import torch
 
 FIELDS = ("feat", "proprio", "a_b", "a_bar", "reward", "done", "next_feat", "next_proprio", "next_a_b", "mc_return")
-SMALL = ("proprio", "a_b", "a_bar", "reward", "done", "next_proprio", "next_a_b", "mc_return")
+SMALL = ("proprio", "a_b", "a_bar", "reward", "done", "next_proprio", "next_a_b", "mc_return", "steps")
+DEFAULTS = {"steps": 1.0}   # env steps between s and s' (the TD target discounts the bootstrap by gamma ** steps)
 
 
 class FrameRef:
@@ -69,6 +70,7 @@ class ReplayBuffer:
             "reward": np.zeros((c,), dtype=np.float32),
             "done": np.zeros((c,), dtype=np.float32),
             "mc_return": np.zeros((c,), dtype=np.float32),
+            "steps": np.ones((c,), dtype=np.float32),
             "obs_id": np.zeros((c,), dtype=np.int64),        # frame slot of s
             "next_obs_id": np.zeros((c,), dtype=np.int64),   # frame slot of s'
             "clock": np.zeros((c,), dtype=np.int64),         # frames_added when the older of the two was written
@@ -100,7 +102,7 @@ class ReplayBuffer:
             so, sn = self._put(tr["feat"]), self._put(tr["next_feat"])
             i = self.ptr
             for k in SMALL:
-                self.data[k][i] = tr.get(k, 0.0)
+                self.data[k][i] = tr.get(k, DEFAULTS.get(k, 0.0))
             self.data["obs_id"][i], self.data["next_obs_id"][i] = so[0], sn[0]
             self.data["clock"][i] = min(so[1], sn[1])
             self.ptr = (self.ptr + 1) % self.capacity
@@ -172,6 +174,8 @@ class ReplayBuffer:
         if n > self.capacity:
             raise ValueError(f"{path}: {n} transitions > capacity {self.capacity}")
         for k in SMALL:
+            if k not in d.files:
+                continue
             if d[k].shape[1:] != self.data[k].shape[1:]:
                 raise ValueError(f"{path}: field {k} shape {d[k].shape[1:]} != buffer {self.data[k].shape[1:]}")
         with self.lock:
@@ -198,7 +202,7 @@ class ReplayBuffer:
                 self.data["obs_id"][:n], self.data["next_obs_id"][:n] = np.arange(n), n + np.arange(n)
                 self.data["clock"][:n] = 0
             for k in SMALL:
-                self.data[k][:n] = d[k][:n]
+                self.data[k][:n] = d[k][:n] if k in d.files else DEFAULTS.get(k, 0.0)   # files without 'steps': 1
             self.size = self.ptr = self.total_added = n
             self.ptr %= self.capacity
             self.frames_added, self.frame_ptr = nf, nf % self.frame_capacity
@@ -276,6 +280,54 @@ def symmetric_sample(offline: ReplayBuffer, online: ReplayBuffer, batch: int, rn
     a = offline.sample(batch // 2, rng)
     b = online.sample(batch - batch // 2, rng)
     return {k: np.concatenate([a[k], b[k]], axis=0) for k in a}
+
+
+def aggregate_transitions(trs: list[dict], hold: int, n_step: int, gamma: float) -> list[dict]:
+    """Turn the per-env-step transitions of one contiguous segment (one specialist stage of one episode, in order,
+    starting at a residual decision step) into the learner's transitions:
+
+    1. residual hold: consecutive blocks of `hold` env steps, during which the residual was held fixed, become one
+       transition: s, a_b, a_bar of the block's first step; reward = sum_j gamma^j r_j; s', a_b' and done of its
+       last step; steps = block length (the last block may be shorter when the segment ends inside it).
+    2. n-step: every block j is backed up over blocks j..j+n_step-1 (stopping at a terminal one):
+       reward = sum of their discounted rewards, s' / a_b' / done of the last one, steps = their total length.
+    The TD target is then  reward + gamma ** steps * (1 - done) * Q(s', a_b', pi(s', a_b')).
+    mc_return (offline data) is taken from the first step of each transition."""
+    if not trs:
+        return []
+    hold, n_step = max(1, int(hold)), max(1, int(n_step))
+    blocks = []
+    for a in range(0, len(trs), hold):
+        b = trs[a:a + hold]
+        f, last = b[0], b[-1]
+        if f.get("feat") is None:
+            raise ValueError("first step of a residual block has no features (block alignment bug)")
+        blocks.append({
+            **{k: f[k] for k in ("feat", "proprio", "a_b", "a_bar") if k in f},
+            "mc_return": f.get("mc_return", 0.0), "_residual": f.get("_residual", False),
+            "reward": sum(gamma ** j * float(t.get("reward", 0.0)) for j, t in enumerate(b)),
+            "done": float(last.get("done", 0.0)), "steps": float(len(b)),
+            "next_feat": last.get("next_feat"), "next_proprio": last.get("next_proprio"), "next_a_b": last.get("next_a_b"),
+        })
+    out = []
+    for j in range(len(blocks)):
+        R, steps, last = 0.0, 0.0, None
+        for m in blocks[j:j + n_step]:
+            R += gamma ** steps * m["reward"]
+            steps += m["steps"]
+            last = m
+            if m["done"]:
+                break
+        tr = {**blocks[j], "reward": R, "steps": steps, "done": last["done"], "next_proprio": last["next_proprio"],
+              "next_a_b": last["next_a_b"], "next_feat": last["next_feat"]}
+        if tr["next_feat"] is None:        # terminal: s' is never used; any stored frame will do
+            if not tr["done"]:
+                raise ValueError("non-terminal transition without next-state features")
+            tr["next_feat"] = tr["feat"]
+        if tr["next_a_b"] is None:
+            tr["next_a_b"] = np.zeros_like(np.asarray(tr["a_b"]))
+        out.append(tr)
+    return out
 
 
 def segment_mc_returns(rewards: np.ndarray, dones: np.ndarray, gamma: float) -> np.ndarray:

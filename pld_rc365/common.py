@@ -155,6 +155,8 @@ def make_runner(cfg, venv, base, backbone, specs, num_stages: int) -> Runner:
                     specs, residual_dims=int(cfg["residual"]["dims"]), gamma=float(cfg["rl"]["discount"]))
     runner.timeout_terminal = bool(cfg["rl"].get("timeout_terminal", True))
     runner.aug_views = aug_views(cfg)
+    runner.hold = max(1, int(cfg["rl"].get("residual_hold", 1)))
+    runner.n_step = max(1, int(cfg["rl"].get("n_step", 1)))
     runner.aug_pad = int((cfg["residual"].get("augment") or {}).get("pad", 4))
     return runner
 

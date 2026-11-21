@@ -80,6 +80,9 @@ rl:                          # Table 5
                              # episode terminates and resets on task success with a restricted time limit ... a reward
                              # r in {0,1} is assigned"). false = bootstrap at the time limit: failures then never give a
                              # zero target (all runs before 2026-11-21; Q stayed 0.4-0.6 while success fell to 0.1-0.3).
+  residual_hold: 1           # env steps the residual is held fixed after each decision (1 = decide every step,
+                             # as in the paper). > 1: one transition per block, reward summed, bootstrap gamma^steps.
+  n_step: 1                  # residual decisions per TD backup (1 = the paper's 1-step TD, Eq. 2)
   utd: 2.0                   # critic updates per stored online transition (async learner throttle). With
                              # critic_actor_ratio 2 this is 2 critic + 1 actor/temperature update per transition, the
                              # per-cycle pattern of the unofficial implementation (utd: 2). The paper gives no value

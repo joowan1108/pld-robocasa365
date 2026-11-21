@@ -132,7 +132,8 @@ class ResidualSAC:
             if self.rl.get("backup_entropy", False):
                 q_next = q_next - self.log_alpha.exp() * logp
             r = b["reward"] + float(self.rl.get("reward_bias", 0.0))
-            return r + self.gamma * (1.0 - b["done"]) * q_next
+            disc = self.gamma ** b["steps"] if "steps" in b else self.gamma   # residual hold / n-step backups
+            return r + disc * (1.0 - b["done"]) * q_next
 
     def _soft_update(self):
         with torch.no_grad():
@@ -352,7 +353,8 @@ class AsyncLearner(threading.Thread):
         try:
             last_log = time.time()
             while not self.stop_flag.is_set():
-                budget = self.utd * self.online.total_added
+                # updates per stored env step (with residual hold / n-step, one buffer transition spans several)
+                budget = self.utd * max(self.online.total_added, self.agent.online_steps)
                 if len(self.online) == 0 or self.agent.n_updates >= budget:
                     time.sleep(0.005)
                     continue

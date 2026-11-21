@@ -201,3 +201,22 @@ def test_stage1_fixed_initial_state_pool(patched, monkeypatch):
     assert {e["seed"] for e in eps} <= pool and all(e.get("init") is not None for e in eps)
     assert json.loads((rd / "timing.json").read_text())["extra"]["init_seed_pool"] == sorted(pool)
     assert (runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / ("L11_S34_n2_e16_p3" + KEY_SUFFIX) / "meta.json").exists()
+
+
+def test_stage1_with_residual_hold_and_n_step(patched, monkeypatch):
+    """End to end with rl.residual_hold / rl.n_step: offline, Cal-QL, warm-up, online and final eval all run, and the
+    stored transitions span several env steps."""
+    import numpy as np
+    import pld_rc365.stage1_train as s1
+
+    runs = patched / "runs"
+    monkeypatch.setattr(sys, "argv", ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--set", *TINY,
+                                      f"paths.runs_root={runs}", "rl.residual_hold=3", "rl.n_step=2"])
+    s1.main()
+    rd = runs / "xr1" / "CoffeeSetupMug" / "stage1"
+    eps = [json.loads(l) for l in (rd / "episodes.jsonl").read_text().splitlines()]
+    assert {e["phase"] for e in eps} >= {"offline", "warmup", "online", "final_eval"}
+    cache = runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / ("L11_S34_n2_e16" + KEY_SUFFIX + "_h3n2")
+    d = np.load(cache / "stage0.npz")
+    steps = d["steps"][: int(d["size"])]
+    assert steps.max() > 1 and steps.max() <= 6

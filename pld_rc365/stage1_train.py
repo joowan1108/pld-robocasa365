@@ -59,6 +59,9 @@ def offline_cache_dir(cfg: dict, spec, n_off: int) -> Path:
         key += f"_c{len(cfg['residual']['cameras'])}"
     if aug_views(cfg):
         key += f"_v{aug_views(cfg)}p{int(cfg['residual']['augment'].get('pad', 4))}"
+    hold, nst = int(cfg["rl"].get("residual_hold", 1)), int(cfg["rl"].get("n_step", 1))
+    if hold > 1 or nst > 1:                          # stored transitions are block / n-step aggregates
+        key += f"_h{hold}n{nst}"
     return root / cfg["model_name"] / cfg["task_name"] / "offline_cache" / key
 
 
@@ -73,6 +76,9 @@ def offline_meta(cfg: dict, spec, fmap_shape, n_cams: int, n_off: int) -> dict:
         "offline_seed_base": int(cfg["seeds"]["offline"]),
         **({"init_seed_pool": len(init_seed_pool(cfg))} if init_seed_pool(cfg) else {}),
         **({"augment": dict(cfg["residual"]["augment"])} if aug_views(cfg) else {}),
+        # only when not 1/1, so buffers written before these options existed still match
+        **({"residual_hold": int(cfg["rl"].get("residual_hold", 1)), "n_step": int(cfg["rl"].get("n_step", 1))}
+           if int(cfg["rl"].get("residual_hold", 1)) > 1 or int(cfg["rl"].get("n_step", 1)) > 1 else {}),
     }
 
 

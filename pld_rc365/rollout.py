@@ -29,7 +29,7 @@ import torch
 
 from .base.client import BasePolicy
 from .envs.rc365_env import VecEnv, threshold_discrete
-from .rl.buffers import FrameRef, ReplayBuffer, segment_mc_returns
+from .rl.buffers import FrameRef, ReplayBuffer, aggregate_transitions, segment_mc_returns
 from .rl.networks import random_shift
 
 
@@ -75,6 +75,8 @@ class _EnvState:
     t: int = 0
     stage: int = 0
     feat: FrameRef | None = None   # features of the current observation (shared with the stored transitions)
+    block0: int = 0                # step at which the current residual-hold block grid starts (takeover / stage start)
+    held: np.ndarray | None = None # residual held since the last decision step
     pending: dict | None = None
     took_over: bool = False
     takeover_step: int | None = None
@@ -115,6 +117,9 @@ class Runner:
         # Image augmentation for the learner (residual.augment): number of randomly shifted copies encoded per
         # stored frame (0 = off) and the shift range in pixels. The actor always acts on the plain frame.
         self.aug_views, self.aug_pad = 0, 4
+        # rl.residual_hold: env steps the residual is held fixed after each decision (1 = decide every step).
+        # rl.n_step: residual decisions per TD backup. Either > 1: transitions are aggregated at episode end.
+        self.hold, self.n_step = 1, 1
         self._aug_gen = torch.Generator().manual_seed(0)
         try:   # FrozenBackbone encodes the views in chunks of one view; simple callables take the whole batch
             self._chunked = "chunk" in inspect.signature(getattr(backbone, "forward", backbone)).parameters
@@ -151,13 +156,23 @@ class Runner:
             return True
         return self._residual_phase(s)
 
+    @property
+    def aggregating(self) -> bool:
+        return self.hold > 1 or self.n_step > 1
+
+    def _block_start(self, s: _EnvState) -> bool:
+        return (s.t - s.block0) % self.hold == 0
+
     def _push(self, s: _EnvState, k: int, tr: dict):
         s.n_stored += 1
         if s.spec.store == "offline":
             s.traj.append((k, tr))
         elif s.spec.store == "online":
             sp = self.spec[k]
-            sp.online.add(tr)
+            if self.aggregating:
+                s.traj.append((k, tr))      # added at episode end (_flush_online)
+            else:
+                sp.online.add(tr)
             sp.agent.online_steps += 1
             if tr.get("_residual", False):
                 sp.agent.xi_steps += 1
@@ -177,7 +192,17 @@ class Runner:
             mc = segment_mc_returns(r, dn, self.gamma)
             for t, g in zip(trs, mc):
                 t["mc_return"] = g
+            if self.aggregating:
+                trs = aggregate_transitions(trs, self.hold, self.n_step, self.gamma)
             self.spec[k].offline.add_many(trs)
+
+    def _flush_online(self, s: _EnvState):
+        if s.spec.store != "online" or not self.aggregating or not s.traj:
+            return
+        import itertools
+        for k, grp in itertools.groupby(s.traj, key=lambda x: x[0]):   # contiguous stage segments
+            self.spec[k].online.add_many(aggregate_transitions([tr for _, tr in grp], self.hold, self.n_step, self.gamma))
+        s.traj = []
 
     # ------------------------------------------------------------------ main loop
     def run(self, next_spec: Callable[[], EpisodeSpec | None],
@@ -196,6 +221,7 @@ class Runner:
             self.base.reset_env(i, pkt)
             ls = pkt.get("layout_style")
             states[i] = _EnvState(spec=sp, pkt=pkt, stage=pkt["stage"],
+                                  block0=int(sp.t_base) if sp.mode == "pld" else 0,
                                   scene=tuple(int(x) for x in ls) if ls and None not in ls else None,
                                   init=[round(float(v), 4) for v in np.asarray(pkt["proprio"]).ravel()[:10]])
 
@@ -234,7 +260,7 @@ class Runner:
                     s.pending = None
             # 3. features where needed (cached from the previous step when available)
             need = [i for i in active if (self._acts_residual(states[i]) or self._stores_now(states[i]))
-                    and states[i].feat is None]
+                    and states[i].feat is None and self._block_start(states[i])]
             if need:
                 feats = self._features([states[i].pkt for i in need])
                 for i, f in zip(need, feats):
@@ -243,17 +269,22 @@ class Runner:
             actions: dict[int, np.ndarray] = {}
             a_bar: dict[int, np.ndarray] = {}
             groups: dict[tuple[int, bool], list[int]] = {}
+            held: list[int] = []
             for i in active:
                 s = states[i]
                 if s.spec.mode == "pld" and s.t >= s.spec.t_base and not s.took_over:
                     s.took_over, s.takeover_step = True, s.t
                 if self._acts_residual(s):
-                    groups.setdefault((s.stage, s.spec.deterministic), []).append(i)
+                    if self._block_start(s) or s.held is None:
+                        groups.setdefault((s.stage, s.spec.deterministic), []).append(i)
+                    else:
+                        held.append(i)          # residual held from the last decision step
                 else:
                     actions[i] = a_b[i]
                     a_bar[i] = np.clip(a_b[i][: self.d], -1.0, 1.0)
                     if s.spec.mode == "pld" and s.t < s.spec.t_base:
                         self.stats["probe_steps"] += 1
+            decided = []
             for (k, det), idxs in groups.items():
                 sp = self.spec[k]
                 with sp.actor_lock:
@@ -264,28 +295,33 @@ class Runner:
                         np.stack([a_b[i] for i in idxs]),
                         deterministic=det,
                     )
+                for i, ad in zip(idxs, a_d):
+                    states[i].held = ad
+                    decided.append(i)
+            for i in decided + held:
+                ad = states[i].held
+                sp = self.spec[states[i].stage]
                 xi_now = float(sp.agent.xi)
                 xi_dim = xi_now * np.asarray(getattr(sp.agent, "xi_scale_np", 1.0)) * np.ones(self.d)   # bound per dim
-                for i, ad in zip(idxs, a_d):
-                    s_ = states[i]
-                    if s_.res_sum is None:
-                        z = np.zeros(self.d)
-                        s_.res_sum, s_.res_abs, s_.res_bound, s_.base_abs = z.copy(), z.copy(), z.copy(), z.copy()
-                    s_.res_n += 1
-                    s_.res_sum += ad
-                    s_.res_abs += np.abs(ad)
-                    s_.res_bound += np.abs(ad) > 0.95 * xi_dim
-                    s_.base_abs += np.abs(a_b[i][: self.d])
-                    s_.res_xi = xi_now
-                    s_.res_xi_dim = xi_dim
-                    ab = np.clip(a_b[i][: self.d] + ad, -1.0, 1.0)
-                    act = a_b[i].copy()
-                    act[: self.d] = ab
-                    actions[i], a_bar[i] = act, ab
-                    self.stats["residual_steps"] += 1
+                s_ = states[i]
+                if s_.res_sum is None:
+                    z = np.zeros(self.d)
+                    s_.res_sum, s_.res_abs, s_.res_bound, s_.base_abs = z.copy(), z.copy(), z.copy(), z.copy()
+                s_.res_n += 1
+                s_.res_sum += ad
+                s_.res_abs += np.abs(ad)
+                s_.res_bound += np.abs(ad) > 0.95 * xi_dim
+                s_.base_abs += np.abs(a_b[i][: self.d])
+                s_.res_xi = xi_now
+                s_.res_xi_dim = xi_dim
+                ab = np.clip(a_b[i][: self.d] + ad, -1.0, 1.0)
+                act = a_b[i].copy()
+                act[: self.d] = ab
+                actions[i], a_bar[i] = act, ab
+                self.stats["residual_steps"] += 1
             # 5. step
             stores = {i: self._stores_now(states[i]) for i in active}
-            acted_residual = {i for _, idxs in groups.items() for i in idxs}
+            acted_residual = set(decided) | set(held)
             out = self.venv.step(actions)
             dead = [i for i in active if out[i].get("_dead")]
             if dead:   # the worker hung or died and was replaced (VecEnv watchdog): drop these episodes
@@ -304,7 +340,10 @@ class Runner:
                     self._check_step(i, popped, a_b[i], actions[i], a_bar[i], out[i])
                 self.base.observe(i, out[i])
             # 6. next-state features for transitions being stored
-            nf_idx = [i for i in active if stores[i]]
+            # s' features: at the end of a residual-hold block or of the segment (always when hold = 1)
+            nf_idx = [i for i in active if stores[i] and (
+                (out[i]["t"] - states[i].block0) % self.hold == 0 or out[i]["stage"] > states[i].stage
+                or out[i]["success"] or out[i]["t"] >= self.horizon)]
             next_feats = dict(zip(nf_idx, self._features([out[i] for i in nf_idx]))) if nf_idx else {}
             # 7. bookkeeping / transitions / episode ends
             ended: list[int] = []
@@ -315,7 +354,7 @@ class Runner:
                     tr = {
                         "feat": s.feat, "proprio": s.pkt["proprio"], "a_b": a_b[i], "a_bar": a_bar[i],
                         "reward": 1.0 if advanced else 0.0, "done": 1.0 if advanced else 0.0,
-                        "next_feat": next_feats[i], "next_proprio": nxt["proprio"],
+                        "next_feat": next_feats.get(i), "next_proprio": nxt["proprio"],
                         "_residual": i in acted_residual,
                     }
                     if advanced:
@@ -324,6 +363,8 @@ class Runner:
                     else:
                         s.pending = (s.stage, tr)
                 s.t, s.stage, s.pkt = nxt["t"], nxt["stage"], nxt
+                if advanced:   # next stage: new block grid, new decision
+                    s.block0, s.held = s.t, None
                 s.feat = next_feats.get(i)
                 if nxt["success"] or s.stage >= self.K or s.t >= self.horizon:
                     ended.append(i)
@@ -343,6 +384,7 @@ class Runner:
                     self._push(s, k, tr)
                     s.pending = None
                 self._flush_offline(s, success)
+                self._flush_online(s)
                 rec_dir = None
                 if s.spec.record:
                     keep = success and self._keep_record(s)

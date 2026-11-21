@@ -605,3 +605,56 @@ def test_runner_drops_the_episode_of_a_replaced_worker():
     assert sorted(r.spec.seed for r in res) == [1, 5]   # the dropped episode (seed 3) reports no result
     # complete transitions stored before the hang stay (real experience); the one waiting for next_a_b is dropped
     assert specs[0].online.size == 12 + 12 + 4                # 4 = n_stored reported for the dropped episode
+
+
+def test_aggregate_transitions_hold_and_n_step():
+    from pld_rc365.rl.buffers import aggregate_transitions
+    g = 0.5
+    trs = [{"feat": f"f{t}" if t % 3 == 0 else None, "proprio": t, "a_b": np.full(12, t), "a_bar": np.full(7, t),
+            "reward": 1.0 if t == 7 else 0.0, "done": 1.0 if t == 7 else 0.0,
+            "next_feat": f"f{t + 1}" if (t + 1) % 3 == 0 else None, "next_proprio": t + 1,
+            "next_a_b": np.full(12, t + 1), "mc_return": g ** (7 - t)} for t in range(8)]
+    out = aggregate_transitions(trs, hold=3, n_step=2, gamma=g)
+    assert [o["proprio"] for o in out] == [0, 3, 6]                       # one per block of 3 steps
+    assert [o["steps"] for o in out] == [6, 5, 2]                         # 3+3, 3+2 (segment ends), 2
+    assert [o["done"] for o in out] == [0.0, 1.0, 1.0]
+    assert out[0]["next_proprio"] == 6 and out[0]["next_feat"] == "f6" and out[0]["reward"] == 0.0
+    assert out[1]["reward"] == g ** 4 and out[2]["reward"] == g ** 1    # reward at step 7, discounted to t=3 / t=6
+    assert out[2]["mc_return"] == g ** 1 and out[0]["mc_return"] == g ** 7
+    assert out[2]["next_feat"] == "f6"                                    # terminal: placeholder frame
+
+
+def test_runner_holds_the_residual_and_stores_block_transitions():
+    """rl.residual_hold = 4, n_step = 2: the actor decides only every 4 env steps from the takeover step, the residual
+    is held in between, and the online buffer gets one transition per block, discounted over the steps it spans."""
+    runner, venv, base, specs = make_runner(num_envs=1, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    runner.hold, runner.n_step, runner.timeout_terminal = 4, 2, True
+    sp = specs[0]
+    sp.agent.online_steps = 0
+    decisions = []
+    real_act = sp.agent.act
+    def act(actor, feats, *a, **k):
+        out = real_act(actor, feats, *a, **k)
+        decisions.append(out.copy())
+        return out
+    sp.agent.act = act
+    res = run_n(runner, [EpisodeSpec(seed=1, mode="pld", t_base=2, store="online")], 1)[0]
+    assert len(decisions) == 3                                            # at steps 2, 6, 10
+    assert res.n_stored == 10 and sp.agent.online_steps == 10             # steps 2..11 (probing 0..1 not stored)
+    executed = np.array(venv.actions[(0, 1)])[:, :7]
+    runner2, venv2, _, _ = make_runner(num_envs=1, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    run_n(runner2, [EpisodeSpec(seed=1, mode="base", store="none")], 1)
+    base_actions = np.array(venv2.actions[(0, 1)])[:, :7]                 # the scripted VLA actions, no residual
+    resid = executed - base_actions
+    assert np.allclose(resid[:2], 0)                                      # probing: VLA only
+    expected = np.concatenate([np.repeat(d, n, 0) for d, n in zip(decisions, (4, 4, 2))])
+    np.testing.assert_allclose(resid[2:, :6], expected[:, :6], atol=1e-6)  # one decision held per block (the
+                                                                          # gripper dim is clipped at the VLA's +-1)
+    assert not np.allclose(decisions[0], decisions[1])
+    buf = sp.online
+    assert buf.size == 3                                                  # blocks starting at 2, 6, 10
+    np.testing.assert_allclose(buf.data["steps"][:3], [8, 6, 2])          # 4+4, 4+2, 2 (time limit)
+    np.testing.assert_allclose(buf.data["done"][:3], [0, 1, 1])
+    np.testing.assert_allclose(buf.data["proprio"][:3, 0], [2, 6, 10])    # s of each transition = block start
+    np.testing.assert_allclose(buf.data["next_proprio"][:3, 0], [10, 12, 12])
+    assert np.array_equal(buf.data["next_obs_id"][0], buf.data["obs_id"][2])   # s' of block 0 (n=2) is s of block 2
