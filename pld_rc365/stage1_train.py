@@ -59,7 +59,7 @@ def offline_cache_dir(cfg: dict, spec, n_off: int) -> Path:
         key += f"_c{len(cfg['residual']['cameras'])}"
     if aug_views(cfg):
         key += f"_v{aug_views(cfg)}p{int(cfg['residual']['augment'].get('pad', 4))}"
-    hold, nst = int(cfg["rl"].get("residual_hold", 1)), int(cfg["rl"].get("n_step", 1))
+    hold, nst = int(cfg.get("rl", {}).get("residual_hold", 1)), int(cfg.get("rl", {}).get("n_step", 1))
     if hold > 1 or nst > 1:                          # stored transitions are block / n-step aggregates
         key += f"_h{hold}n{nst}"
     return root / cfg["model_name"] / cfg["task_name"] / "offline_cache" / key

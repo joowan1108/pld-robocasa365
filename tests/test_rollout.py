@@ -468,6 +468,8 @@ def test_offline_cache_key_depends_on_what_the_buffers_store():
     assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16_i256_c3_v4p4"
     cfg["residual"]["augment"] = {"views": 0, "pad": 4}
     assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16_i256_c3"
+    cfg["rl"] = {"residual_hold": 8, "n_step": 3}
+    assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16_i256_c3_h8n3"
 
 
 def test_random_shift_is_a_replicate_padded_crop():
