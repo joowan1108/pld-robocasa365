@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .buffers import ReplayBuffer, symmetric_sample
+from .buffers import BatchPrefetcher, ReplayBuffer, symmetric_sample
 from .networks import Critic, Encoder, ResidualActor, combine
 
 
@@ -267,13 +267,27 @@ class ResidualSAC:
         aloss.backward()
         for opt in (self.critic_opt, self.actor_opt, self.alpha_opt):
             opt.zero_grad(set_to_none=True)
+        # batches the prefetch threads keep on the device (queue + one in flight per thread)
+        nt = int(self.rl.get("prefetch_threads", 0))
+        if nt > 0:
+            hold = [torch.empty((2, B, *feat), dtype=torch.float16, device=self.device)
+                    for _ in range(nt + int(self.rl.get("prefetch_depth", 2)))]
+            del hold
 
     def pretrain_calql(self, offline: ReplayBuffer, steps: int, log_fn=None):
         alpha = float(self.rl["calql"]["alpha"])
-        for i in range(steps):
-            info = self.update(offline.sample(self.batch, self.rng), calql_alpha=alpha)
-            if log_fn and (i % 1000 == 0 or i == steps - 1):
-                log_fn(step=i, **info)
+        nt = int(self.rl.get("prefetch_threads", 0))
+        pf = BatchPrefetcher(offline, None, self.batch, self.device, threads=nt, depth=int(self.rl.get("prefetch_depth", 2)),
+                             seed=int(self.rng.integers(2**31))) if nt > 0 else None
+        try:
+            for i in range(steps):
+                b = pf.get() if pf else offline.sample(self.batch, self.rng)
+                info = self.update(b, calql_alpha=alpha)
+                if log_fn and (i % 1000 == 0 or i == steps - 1):
+                    log_fn(step=i, **info)
+        finally:
+            if pf:
+                pf.close()
         self.init_actor()  # Alg. 1: delta policy randomly initialised after critic warm-start
         self.n_updates = 0
 
@@ -325,6 +339,8 @@ class AsyncLearner(threading.Thread):
             self.collector_actor.load_state_dict(self.agent.actor.state_dict())
 
     def run(self):
+        nt = int(self.agent.rl.get("prefetch_threads", 0))
+        pf = None
         try:
             last_log = time.time()
             while not self.stop_flag.is_set():
@@ -332,7 +348,12 @@ class AsyncLearner(threading.Thread):
                 if len(self.online) == 0 or self.agent.n_updates >= budget:
                     time.sleep(0.005)
                     continue
-                info = self.agent.update(symmetric_sample(self.offline, self.online, self.agent.batch, self.agent.rng))
+                if nt > 0 and pf is None:   # started once the online buffer has data: every batch is half/half
+                    pf = BatchPrefetcher(self.offline, self.online, self.agent.batch, self.agent.device, threads=nt,
+                                         depth=int(self.agent.rl.get("prefetch_depth", 2)),
+                                         seed=int(self.agent.rng.integers(2**31)))
+                b = pf.get() if pf else symmetric_sample(self.offline, self.online, self.agent.batch, self.agent.rng)
+                info = self.agent.update(b)
                 if self.agent.n_updates % self.sync_every == 0:
                     self.push_actor()
                 if self.log_fn and time.time() - last_log > 30:
@@ -341,6 +362,9 @@ class AsyncLearner(threading.Thread):
         except BaseException as e:  # noqa: BLE001
             self.error = e
             raise
+        finally:
+            if pf is not None:
+                pf.close()
 
     def stop(self):
         self.stop_flag.set()

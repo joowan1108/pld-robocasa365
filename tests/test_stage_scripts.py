@@ -8,6 +8,8 @@ import pytest
 
 from .fakes import FakeBackbone, FakeBase, FakeVecEnv
 
+# offline-cache key suffix for the default residual input (256 px, 3 cameras, 4 augmented views, pad 4)
+KEY_SUFFIX = "_i256_c3_v4p4"
 TINY = [
     "rl.device=cpu", "rl.hidden_dim=16", "rl.latent_dim=8", "rl.num_spatial_features=2", "rl.batch_size=8",
     "rl.buffer_capacity=2000", "rl.offline_successes=2", "rl.calql.steps=3", "rl.calql.num_samples=2",
@@ -79,7 +81,7 @@ def test_stage1_offline_buffer_saved_and_reused(patched, monkeypatch):
               f"paths.runs_root={runs}"]
     monkeypatch.setattr(sys, "argv", ["stage1", *common])
     s1.main()
-    cache = runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / "L11_S34_n2_e16_i256"
+    cache = runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / ("L11_S34_n2_e16" + KEY_SUFFIX)
     meta = json.loads((cache / "meta.json").read_text())
     assert (cache / "stage0.npz").exists() and meta["stats"]["successes"] == 2 and meta["gamma"] == 0.99
     first = json.loads((runs / "xr1" / "CoffeeSetupMug" / "stage1" / "timing.json").read_text())
@@ -114,7 +116,7 @@ def test_stage1_warmup_cache_saved_and_reused(patched, monkeypatch):
             f"paths.runs_root={runs}"]
     monkeypatch.setattr(sys, "argv", base)
     s1.main()
-    cache = runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / "L11_S34_n2_e16_i256"
+    cache = runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / ("L11_S34_n2_e16" + KEY_SUFFIX)
     wdirs = sorted(cache.glob("warmup_*"))
     assert len(wdirs) == 1 and (wdirs[0] / "agent0.pt").exists() and (wdirs[0] / "online0.npz").exists()
     wmeta = json.loads((wdirs[0] / "meta.json").read_text())
@@ -182,7 +184,7 @@ def test_offline_cache_is_keyed_by_exec_steps(patched, monkeypatch):
         rd = runs / "xr1" / "CoffeeSetupMug" / "stage1"
         rd.rename(rd.with_name(f"stage1_e{ex}"))
     caches = sorted(p.name for p in (runs / "xr1" / "CoffeeSetupMug" / "offline_cache").iterdir())
-    assert caches == ["L11_S34_n2_e16_i256", "L11_S34_n2_e4_i256"]      # separate buffers, nothing overwritten
+    assert caches == ["L11_S34_n2_e16" + KEY_SUFFIX, "L11_S34_n2_e4" + KEY_SUFFIX]      # separate buffers, nothing overwritten
 
 
 def test_stage1_fixed_initial_state_pool(patched, monkeypatch):
@@ -198,4 +200,4 @@ def test_stage1_fixed_initial_state_pool(patched, monkeypatch):
     assert {e["phase"] for e in eps} >= {"offline", "warmup", "online", "final_eval"}
     assert {e["seed"] for e in eps} <= pool and all(e.get("init") is not None for e in eps)
     assert json.loads((rd / "timing.json").read_text())["extra"]["init_seed_pool"] == sorted(pool)
-    assert (runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / "L11_S34_n2_e16_p3_i256" / "meta.json").exists()
+    assert (runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / ("L11_S34_n2_e16_p3" + KEY_SUFFIX) / "meta.json").exists()

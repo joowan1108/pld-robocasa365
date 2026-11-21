@@ -29,7 +29,7 @@ B.2 and C (Table 5).
 | 9 | ξ is "tuned by a scheduler", but Table 5 gives 0.5 | **Linear ramp 0.1 → 0.5** over the first 50k *residual-acted* online steps. Warm-up and probing steps do not count. Stage 2 and eval reload the ξ the actor finished training with. The form and length are not in the paper (`residual.xi_*`). | user; paper §3.1, B.2 |
 | 10 | Cal-QL steps and α | 20k steps, α = 5, MC returns from sparse rewards. The actor is randomly re-initialized afterwards. | Alg. 1; steps/α not given |
 | 11 | Long composite tasks | Per-stage specialists with sparse per-stage rewards, switched by a state machine on sim-state predicates (`pld_rc365/envs/stages.py`). This follows the paper's real-world long-horizon (YAM) recipe. The toaster `wait` stage is base-only. | user; paper §4.4 |
-| 12 | Residual observation | Frozen ImageNet ResNet-10 (`timm resnet10t`) on 128² `agentview_left` + `eye_in_hand`, SERL spatial embeddings, proprio (16), `a_b` (12). | Table 5 |
+| 12 | Residual observation | Frozen ImageNet ResNet-10 (`timm resnet10t`) on the three rendered 256² cameras (`agentview_left`, `agentview_right`, `eye_in_hand`; no downsampling), SERL spatial embeddings per camera, proprio (16), `a_b` (12). Random-shift augmentation (pad 4, as in SERL): each stored frame keeps the features of 4 shifted copies and the learner draws one per camera (`residual.augment`). The paper states only the encoder; resolution, cameras and augmentation are our choices. Runs before 2026-11-21 used 128², two cameras, no augmentation. | Table 5 (encoder only) |
 | 13 | Scene | One fixed (layout, style) per task with `split=None` and pretrain object instances. CoffeeSetupMug uses (11, 34); the other two come from `stage0_sweep`. | user ("scene 고정") |
 | 14 | Residual during Stage-2 collection | Deterministic mean of π_δ. If the base succeeds before takeover, the episode is kept (it is a valid τ_demo) and flagged `pure_base`. | not in paper |
 | 15 | PLD size | Collect 200 successes per task and write nested 50 ⊂ 100 ⊂ 200 datasets. SFT pools the 3 tasks, PLD data only, starting from each FT-RC365 checkpoint. | user |
@@ -208,9 +208,10 @@ python scripts/summarize.py
 
 Override any config value with `--set a.b=c`, e.g. `--set env.num_envs=3 rl.buffer_capacity=100000 probing.alpha=0.6`.
 
-Memory: each specialist's online buffer stores fp16 ResNet feature maps for obs and next obs, about 64 KB per
-transition. At the paper's 250k capacity that is about 16 GB of host RAM per specialist. The arrays are allocated
-lazily, so memory grows with what is actually stored.
+Memory: each specialist's online buffer stores every observation once as fp16 ResNet feature maps: 64 KB per
+camera at 256 px (8x8x512), times cameras, times augmented views. With the defaults (3 cameras, 4 views) that is
+about 0.79 MB per transition, about 200 GB of host RAM at the paper's 250k capacity (16 GB with 2 cameras at 128 px
+and no augmentation). The arrays are allocated lazily, so memory grows with what is actually stored.
 
 ## Verification
 

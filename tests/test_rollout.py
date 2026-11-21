@@ -55,8 +55,9 @@ def test_base_actions_and_next_ab_alignment_online():
     np.testing.assert_allclose(nab, np.arange(1, 13), atol=1e-3)      # next_a_b is the action used at t+1
     assert np.all(buf.data["done"][:12] == 0)
     # features of obs t encode t, next_feat encode t+1
-    np.testing.assert_allclose(buf.data["feat"][:12, 0, 0, 0, 0], np.arange(12), atol=1e-2)
-    np.testing.assert_allclose(buf.data["next_feat"][:12, 0, 0, 0, 0], np.arange(1, 13), atol=1e-2)
+    np.testing.assert_allclose(buf.frames[buf.data["obs_id"][:12], 0, 0, 0, 0, 0], np.arange(12), atol=1e-2)
+    np.testing.assert_allclose(buf.frames[buf.data["next_obs_id"][:12], 0, 0, 0, 0, 0], np.arange(1, 13), atol=1e-2)
+    assert buf.frames_added == 13                                     # each observation is stored once
     # base-only data: a_bar = a_b[:7]
     np.testing.assert_allclose(buf.data["a_bar"][:12], np.clip(buf.data["a_b"][:12, :7], -1, 1))
 
@@ -113,8 +114,8 @@ def test_segment_returns_and_symmetric_sampling():
     np.testing.assert_allclose(segment_mc_returns(r, d, 0.5), [0.25, 0.5, 1, 0.5, 1])
     a, b = ReplayBuffer(10, (1,), 1, 12, 7), ReplayBuffer(10, (1,), 1, 12, 7)
     for _ in range(3):
-        a.add({"reward": 1.0})
-        b.add({"reward": 0.0})
+        a.add({"reward": 1.0, "feat": np.zeros((1,)), "next_feat": np.zeros((1,))})
+        b.add({"reward": 0.0, "feat": np.zeros((1,)), "next_feat": np.zeros((1,))})
     s = symmetric_sample(a, b, 8, np.random.default_rng(0))
     assert s["reward"].sum() == 4
 
@@ -450,17 +451,61 @@ def test_critic_action_residual_separates_vla_action_from_residual():
     assert np.isfinite(info["critic_loss"])
 
 
-def test_offline_cache_key_depends_on_residual_image_size():
-    """Buffers store encoder features of the residual images, so a different image size needs its own cache."""
+def test_offline_cache_key_depends_on_what_the_buffers_store():
+    """Buffers store encoder features of the residual images, so image size, cameras and augmentation are in the key."""
     from types import SimpleNamespace
     from pld_rc365.stage1_train import offline_cache_dir
     spec = SimpleNamespace(layout_id=11, style_id=34)
     cfg = {"paths": {"runs_root": "runs"}, "model_name": "xr1", "task_name": "T", "base": {"exec_steps": 16},
-           "stage1": {"init_seed_pool": 0}, "seeds": {"offline": 0}, "residual": {"image_size": 128}}
-    d128 = offline_cache_dir(cfg, spec, 50)
+           "stage1": {"init_seed_pool": 0}, "seeds": {"offline": 0},
+           "residual": {"image_size": 128, "cameras": ["a", "b"]}}
+    assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16"          # the pre-2026-11-21 buffers
     cfg["residual"]["image_size"] = 256
-    d256 = offline_cache_dir(cfg, spec, 50)
-    assert d128.name == "L11_S34_n50_e16" and d256.name == "L11_S34_n50_e16_i256"
+    assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16_i256"
+    cfg["residual"]["cameras"] = ["a", "b", "c"]
+    assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16_i256_c3"
+    cfg["residual"]["augment"] = {"views": 4, "pad": 4}
+    assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16_i256_c3_v4p4"
+    cfg["residual"]["augment"] = {"views": 0, "pad": 4}
+    assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16_i256_c3"
+
+
+def test_random_shift_is_a_replicate_padded_crop():
+    import torch
+    from pld_rc365.rl.networks import random_shift
+    img = torch.arange(2 * 3 * 6 * 6 * 3, dtype=torch.float32).remainder(251).to(torch.uint8).view(2, 3, 6, 6, 3)
+    g = torch.Generator().manual_seed(0)
+    out = random_shift(img, 2, g)
+    assert out.shape == img.shape and out.dtype == torch.uint8
+    shifts = set()
+    for b in range(2):
+        for c in range(3):
+            pad = torch.nn.functional.pad(img[b, c].permute(2, 0, 1)[None].float(), (2, 2, 2, 2), mode="replicate")[0].permute(1, 2, 0)
+            hits = [(dy, dx) for dy in range(5) for dx in range(5) if torch.equal(pad[dy:dy + 6, dx:dx + 6].to(torch.uint8), out[b, c])]
+            assert hits, "not a crop of the replicate-padded image"
+            shifts.add(hits[0])
+    assert len(shifts) > 1                                                 # drawn per image, not one shift for all
+
+
+def test_runner_stores_augmented_views_and_acts_on_the_plain_frame():
+    """With augmentation on, a stored frame holds the features of K shifted copies (not the plain one), s' of a
+    transition is the same stored frame as s of the next, and the actor is fed the plain frame."""
+    import torch
+    from pld_rc365.rl.buffers import ReplayBuffer
+    runner, venv, base, specs = make_runner(num_envs=1, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    K = 3
+    specs[0].online = ReplayBuffer(500, (2, *FMAP), 16, 12, 7, views=K)
+    runner.aug_views, runner.aug_pad = K, 1
+    seen = []
+    real_act = specs[0].agent.act
+    specs[0].agent.act = lambda actor, feats, *a, **k: (seen.append(np.asarray(feats).copy()), real_act(actor, feats, *a, **k))[1]
+    run_n(runner, [EpisodeSpec(seed=1, mode="pld", t_base=0, store="online")], 1)
+    buf = specs[0].online
+    assert buf.size == 12 and buf.frames_added == 13 and buf.frames.shape[1] == K
+    assert np.array_equal(buf.data["next_obs_id"][:11], buf.data["obs_id"][1:12])
+    assert len(seen) == 12 and all(f.shape == (1, 2, *FMAP) for f in seen)   # one plain frame per acting step
+    b = buf.sample(32, np.random.default_rng(0))
+    assert b["feat"].shape == (32, 2, *FMAP) and b["next_feat"].shape == (32, 2, *FMAP)
 
 
 def test_actor_accepts_precomputed_encoding():

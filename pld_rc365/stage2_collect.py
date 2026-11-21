@@ -53,6 +53,7 @@ def main():
     specs = load_specialists(cfg, spec_path, fmap_shape, n_cams)
     claim_gpu_memory(backbone, specs, venv.num_envs, cfg)
     runner = make_runner(cfg, venv, base, backbone, specs, len(spec.stage_names))
+    runner.aug_views = 0   # nothing is stored here: no augmented views to encode
     runner.keep_pure_base = bool(s2["keep_pure_base"])
     rng = np.random.default_rng(cfg["seeds"]["stage2"])
     seeds = itertools.count(cfg["seeds"]["stage2"])

@@ -36,7 +36,14 @@ residual:
   image_size: 256            # residual actor/critic input. 256 = the rendered camera frame as it is (no resampling):
                              # ResNet-10 feature map 8x8 per camera. The paper gives no resolution. 128 (4x4 map, the
                              # frame downsampled 2x) was used for every run before 2026-11-21.
-  cameras: [robot0_agentview_left, robot0_eye_in_hand]
+  cameras: [robot0_agentview_left, robot0_agentview_right, robot0_eye_in_hand]
+                             # all three RoboCasa cameras (what the VLA sees). Runs before 2026-11-21 used left +
+                             # eye_in_hand only (the paper's real-robot setup: one side view + one wrist camera).
+  augment:                   # DrQ / SERL random-shift image augmentation for the learner (the paper does not mention
+    views: 4                 # it; SERL and the unofficial implementation use it with pad 4). The encoder is frozen,
+    pad: 4                   # so instead of shifting images at every update, each stored frame keeps the features
+                             # of `views` copies shifted by up to +-`pad` px, and every sampled transition draws one
+                             # view per camera, independently for s and s'. views: 0 = off (all runs before).
 
 rl:                          # Table 5
   batch_size: 256
@@ -68,6 +75,10 @@ rl:                          # Table 5
                              # critic_actor_ratio 2 this is 2 critic + 1 actor/temperature update per transition, the
                              # per-cycle pattern of the unofficial implementation (utd: 2). The paper gives no value
                              # (SERL's learner is asynchronous and unthrottled). 1.0 was used until 2026-11-21.
+  prefetch_threads: 3        # background threads that sample batches and move them to the GPU (0 = sample in the
+                             # learner thread, as before 2026-11-21; with 256x256 features the learner then
+                             # reached only ~0.6 updates per stored transition)
+  prefetch_depth: 2          # ready batches kept on the GPU (~100 MB each with 3 cameras at 256 px)
   actor_sync_every: 50       # learner steps between actor weight pushes to the collector
   offline_successes: 50      # n in Alg. 1
   calql:

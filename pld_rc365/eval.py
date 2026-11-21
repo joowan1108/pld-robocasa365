@@ -38,6 +38,7 @@ def evaluate(cfg, scene: str, task: str | None, episodes: int, seed_base: int, s
         specs = load_specialists(cfg, specialists_path, fmap_shape, n_cams)
         claim_gpu_memory(backbone, specs, venv.num_envs, cfg)
     runner = make_runner(cfg, venv, base, backbone, specs, len(spec.stage_names))
+    runner.aug_views = 0   # nothing is stored here: no augmented views to encode
     seeds = iter(range(seed_base, seed_base + episodes))
     res: list[EpisodeResult] = []
 

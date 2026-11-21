@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .common import (build_backbone, build_env_and_base, build_specialists, common_argparser, learnable_stage_ids,
+from .common import (aug_views, build_backbone, build_env_and_base, build_specialists, common_argparser, learnable_stage_ids,
                      make_runner, sample_t_base, save_specialists, sync_collectors)
 from .config import REPO_ROOT, load_config, run_dir
 from .rl.agent import AsyncLearner
@@ -55,6 +55,10 @@ def offline_cache_dir(cfg: dict, spec, n_off: int) -> Path:
         key += f"_p{len(init_seed_pool(cfg))}"
     if int(cfg["residual"]["image_size"]) != 128:   # buffers hold encoder features of the residual images; 128 was
         key += f"_i{int(cfg['residual']['image_size'])}"   # the only size before 2026-11-21 (keys without a suffix)
+    if len(cfg["residual"]["cameras"]) != 2:        # likewise 2 cameras and no augmented views
+        key += f"_c{len(cfg['residual']['cameras'])}"
+    if aug_views(cfg):
+        key += f"_v{aug_views(cfg)}p{int(cfg['residual']['augment'].get('pad', 4))}"
     return root / cfg["model_name"] / cfg["task_name"] / "offline_cache" / key
 
 
@@ -68,6 +72,7 @@ def offline_meta(cfg: dict, spec, fmap_shape, n_cams: int, n_off: int) -> dict:
         "n_successes": n_off, "base_model_path": cfg["base"]["model_path"], "exec_steps": int(cfg["base"]["exec_steps"]),
         "offline_seed_base": int(cfg["seeds"]["offline"]),
         **({"init_seed_pool": len(init_seed_pool(cfg))} if init_seed_pool(cfg) else {}),
+        **({"augment": dict(cfg["residual"]["augment"])} if aug_views(cfg) else {}),
     }
 
 
@@ -89,7 +94,7 @@ def save_offline_cache(cache: Path, specs: dict, meta: dict) -> None:
 # Settings that do not change what Cal-QL + warm-up produce (or only marginally: xi enters the TD target through
 # pi_delta's action at s'). They are recorded in the warm-up cache but not part of its key, so e.g. a xi change
 # can reuse the critic and warm-up data.
-WARMUP_KEY_EXCLUDE_RL = {"device"}
+WARMUP_KEY_EXCLUDE_RL = {"device", "prefetch_threads", "prefetch_depth"}
 WARMUP_KEY_EXCLUDE_RES = {"xi", "xi_schedule", "xi_start", "xi_ramp_steps"}
 
 
@@ -385,6 +390,7 @@ def main():
         # ------------------------------------------------------------ clean evaluation of pi_bar
         if not args.skip_final_eval:
             n_eval = int(s1["final_eval_episodes"])
+            runner.aug_views = 0   # evaluation stores nothing: no augmented views to encode
             pool = init_seed_pool(cfg)
             eseeds = iter([pool[j % len(pool)] for j in range(n_eval)] if pool else
                           range(cfg["eval"]["seed_base"], cfg["eval"]["seed_base"] + n_eval))

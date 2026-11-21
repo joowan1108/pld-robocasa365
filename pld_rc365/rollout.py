@@ -18,6 +18,7 @@ Per transition (specialist k = stage at s_t):
 
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 from dataclasses import dataclass, field
@@ -28,7 +29,8 @@ import torch
 
 from .base.client import BasePolicy
 from .envs.rc365_env import VecEnv, threshold_discrete
-from .rl.buffers import ReplayBuffer, segment_mc_returns
+from .rl.buffers import FrameRef, ReplayBuffer, segment_mc_returns
+from .rl.networks import random_shift
 
 
 @dataclass
@@ -72,7 +74,7 @@ class _EnvState:
     pkt: dict
     t: int = 0
     stage: int = 0
-    feat: np.ndarray | None = None
+    feat: FrameRef | None = None   # features of the current observation (shared with the stored transitions)
     pending: dict | None = None
     took_over: bool = False
     takeover_step: int | None = None
@@ -109,14 +111,31 @@ class Runner:
         # "with a restricted time limit", reward in {0,1} per episode). False: truncation, bootstrap from s_T
         # (failures then never produce a zero-value target; used by the runs before 2026-11-21).
         self.timeout_terminal = False
+        # Image augmentation for the learner (residual.augment): number of randomly shifted copies encoded per
+        # stored frame (0 = off) and the shift range in pixels. The actor always acts on the plain frame.
+        self.aug_views, self.aug_pad = 0, 4
+        self._aug_gen = torch.Generator().manual_seed(0)
+        try:   # FrozenBackbone encodes the views in chunks of one view; simple callables take the whole batch
+            self._chunked = "chunk" in inspect.signature(getattr(backbone, "forward", backbone)).parameters
+        except (TypeError, ValueError):
+            self._chunked = False
         self.abort_on_stop = True               # drop in-flight episodes once on_end requested a stop
         self.check_consistency = True           # cheap per-step invariants (bug guard, no effect on results)
         self.log_every_s = 120.0                # throughput line on stdout
 
     # ------------------------------------------------------------------ helpers
-    def _features(self, pkts: list[dict]) -> np.ndarray:
+    def _features(self, pkts: list[dict]) -> list[FrameRef]:
+        """One FrameRef per observation: the plain frame's features (used to act) and, with augmentation on, the
+        features of `aug_views` randomly shifted copies (what the replay buffers store and train on)."""
         imgs = torch.as_tensor(np.stack([p["res_images"] for p in pkts]), device=self.device)
-        return self.backbone(imgs).cpu().numpy()
+        n = imgs.shape[0]
+        if self.aug_views > 0:
+            allv = torch.cat([imgs] + [random_shift(imgs, self.aug_pad, self._aug_gen) for _ in range(self.aug_views)], 0)
+            f = self.backbone(allv, chunk=n) if self._chunked else self.backbone(allv)
+            f = f.view(1 + self.aug_views, n, *f.shape[1:]).transpose(0, 1)   # (n, 1 + K, n_cam, C, h, w)
+        else:
+            f = self.backbone(imgs)[:, None]
+        return [FrameRef(x) for x in f.cpu().numpy()]
 
     def _residual_phase(self, s: _EnvState) -> bool:
         return s.spec.mode == "pld" and s.t >= s.spec.t_base
@@ -239,7 +258,7 @@ class Runner:
                 with sp.actor_lock:
                     a_d = sp.agent.act(
                         sp.collector_actor,
-                        np.stack([states[i].feat for i in idxs]),
+                        np.stack([states[i].feat.data[0] for i in idxs]),
                         np.stack([states[i].pkt["proprio"] for i in idxs]),
                         np.stack([a_b[i] for i in idxs]),
                         deterministic=det,

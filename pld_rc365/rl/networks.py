@@ -1,7 +1,9 @@
 """Residual actor / critic networks (PLD App. C.1, Table 5; SERL-style image encoder).
 
-* Frozen ImageNet-pretrained ResNet-10 backbone (timm `resnet10t`) -> (512, 4, 4) feature map per 128x128 camera.
-  Features are computed once at collection time and stored in the replay buffer (backbone is frozen).
+* Frozen ImageNet-pretrained ResNet-10 backbone (timm `resnet10t`) -> (512, 8, 8) feature map per 256x256 camera
+  (4x4 at 128x128). Features are computed once at collection time and stored in the replay buffer (backbone is
+  frozen). Image augmentation (random shift, pad 4) is applied before the backbone at collection time: each stored
+  frame keeps the features of K shifted copies and the learner draws one per camera (residual.augment).
 * Trainable SpatialLearnedEmbeddings head per camera (SERL) -> latent 256, LayerNorm, Tanh.
 * Inputs besides images: proprio (16-D); the actor also gets the base action a_b (12-D): pi_delta(.|s, a_b).
   The critic is Q(s, a_bar) as in the paper's Eq. 2 (no a_b input) unless rl.critic_uses_a_b is set.
@@ -38,13 +40,31 @@ class FrozenBackbone(nn.Module):
         return super().train(False)
 
     @torch.no_grad()
-    def forward(self, images_uint8: torch.Tensor) -> torch.Tensor:
-        """images: (B, n_cam, H, W, 3) uint8 -> (B, n_cam, C, h, w) float16."""
+    def forward(self, images_uint8: torch.Tensor, chunk: int | None = None) -> torch.Tensor:
+        """images: (B, n_cam, H, W, 3) uint8 -> (B, n_cam, C, h, w) float16. `chunk`: max samples per forward pass
+        (bounds the activation memory when many augmented views are encoded at once)."""
         B, n = images_uint8.shape[:2]
-        x = images_uint8.flatten(0, 1).permute(0, 3, 1, 2).float().div_(255.0)
-        x = (x - self.mean) / self.std
-        f = self.net(x)
-        return f.view(B, n, *f.shape[1:]).half()
+        outs = []
+        for a in range(0, B, chunk or max(B, 1)):
+            x = images_uint8[a:a + (chunk or B)].flatten(0, 1).permute(0, 3, 1, 2).float().div_(255.0)
+            x = (x - self.mean) / self.std
+            outs.append(self.net(x).half())
+        f = torch.cat(outs, 0) if len(outs) != 1 else outs[0]
+        return f.view(B, n, *f.shape[1:])
+
+
+def random_shift(images_uint8: torch.Tensor, pad: int, generator: torch.Generator | None = None) -> torch.Tensor:
+    """DrQ / SERL random-shift augmentation: pad every image by `pad` pixels (edge replication) and crop it back to
+    its size at a random offset, i.e. shift by an integer in [-pad, pad] along each axis, drawn independently for
+    every image (sample and camera). images: (B, n_cam, H, W, 3) uint8 -> same shape."""
+    B, n, H, W, _ = images_uint8.shape
+    dev = images_uint8.device
+    sh = torch.randint(-pad, pad + 1, (B, n, 2), generator=generator).to(dev)
+    rows = (torch.arange(H, device=dev)[None, None] + sh[..., 0:1]).clamp_(0, H - 1)   # (B, n, H)
+    cols = (torch.arange(W, device=dev)[None, None] + sh[..., 1:2]).clamp_(0, W - 1)   # (B, n, W)
+    bi = torch.arange(B, device=dev)[:, None, None, None]
+    ni = torch.arange(n, device=dev)[None, :, None, None]
+    return images_uint8[bi, ni, rows[:, :, :, None], cols[:, :, None, :]]
 
 
 class SpatialLearnedEmbeddings(nn.Module):

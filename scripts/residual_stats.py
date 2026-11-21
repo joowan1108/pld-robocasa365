@@ -53,7 +53,8 @@ def main():
         agent = ResidualSAC(cfg["rl"], cfg["residual"], fmap, n_cams, device="cpu", seed=0)
         agent.load_state_dict(s)
         xi = agent.xi
-        buf = ReplayBuffer(200_000, (n_cams, *fmap), 16, 12, int(cfg["residual"]["dims"]))
+        buf = ReplayBuffer(200_000, (n_cams, *fmap), 16, 12, int(cfg["residual"]["dims"]),
+                           views=int((meta.get("augment") or {}).get("views", 0)))
         n = buf.load(cache / f"stage{k}.npz")
         b = buf.sample(min(args.n, n), np.random.default_rng(0))
         f, p, ab = (torch.as_tensor(b[x]) for x in ("feat", "proprio", "a_b"))

@@ -73,7 +73,8 @@ def main():
         cache = cands[0].parent
     meta = json.loads((cache / "meta.json").read_text())
     fmap, n_cams = tuple(meta["fmap_shape"]), int(meta["n_cams"])
-    buf = ReplayBuffer(200_000, (n_cams, *fmap), 16, 12, int(cfg["residual"]["dims"]))
+    buf = ReplayBuffer(200_000, (n_cams, *fmap), 16, 12, int(cfg["residual"]["dims"]),
+                           views=int((meta.get("augment") or {}).get("views", 0)))
     n = buf.load(cache / f"stage{args.stage}.npz")
     rng = np.random.default_rng(0)
     ev = buf.sample(min(4096, n), rng)

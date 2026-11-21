@@ -101,10 +101,15 @@ def claim_gpu_memory(backbone, specs: dict, num_envs: int, cfg: dict) -> None:
     if dev.type != "cuda":
         return
     s, n_cams = int(cfg["residual"]["image_size"]), len(cfg["residual"]["cameras"])
-    with torch.no_grad():
+    with torch.no_grad():   # augmented views are encoded in chunks of num_envs, so this is the peak
         backbone(torch.zeros(max(1, num_envs), n_cams, s, s, 3, dtype=torch.uint8, device=dev))
     for sp in specs.values():
         sp.agent.reserve_gpu_memory()
+
+
+def aug_views(cfg: dict) -> int:
+    """Randomly shifted copies encoded and stored per frame for the learner (residual.augment.views; 0 = off)."""
+    return int((cfg["residual"].get("augment") or {}).get("views", 0))
 
 
 def build_specialists(cfg: dict, fmap_shape: tuple, n_cams: int, stage_ids: list[int],
@@ -119,8 +124,8 @@ def build_specialists(cfg: dict, fmap_shape: tuple, n_cams: int, stage_ids: list
             agent=agent,
             collector_actor=collector,
             actor_lock=threading.Lock(),
-            offline=ReplayBuffer(offline_capacity, (n_cams, *fmap_shape), 16, 12, int(res["dims"])),
-            online=ReplayBuffer(cap, (n_cams, *fmap_shape), 16, 12, int(res["dims"])),
+            offline=ReplayBuffer(offline_capacity, (n_cams, *fmap_shape), 16, 12, int(res["dims"]), views=aug_views(cfg)),
+            online=ReplayBuffer(cap, (n_cams, *fmap_shape), 16, 12, int(res["dims"]), views=aug_views(cfg)),
         )
     return out
 
@@ -149,6 +154,8 @@ def make_runner(cfg, venv, base, backbone, specs, num_stages: int) -> Runner:
     runner = Runner(venv, base, backbone, cfg["rl"]["device"], num_stages, set(learnable_stage_ids(cfg)),
                     specs, residual_dims=int(cfg["residual"]["dims"]), gamma=float(cfg["rl"]["discount"]))
     runner.timeout_terminal = bool(cfg["rl"].get("timeout_terminal", True))
+    runner.aug_views = aug_views(cfg)
+    runner.aug_pad = int((cfg["residual"].get("augment") or {}).get("pad", 4))
     return runner
 
 
