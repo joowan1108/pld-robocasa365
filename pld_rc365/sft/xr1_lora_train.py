@@ -239,6 +239,7 @@ def main():
 
     log = open(out / f"train_rank{rank}.jsonl", "a") if rank == 0 else None
     step, epoch, t_loop = 0, 0, time.time()
+    step_loss, window = 0.0, []
     fixed_batch = None
     model.train()
     while step < args.max_steps:
@@ -254,6 +255,7 @@ def main():
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss = loss_mod(batch) / accum
             loss.backward()
+            step_loss += loss.item()          # sum over the micro-batches = mean loss of the whole batch
             if (i + 1) % accum:
                 continue
             torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -261,10 +263,15 @@ def main():
             sched.step()
             opt.zero_grad(set_to_none=True)
             step += 1
+            window.append(step_loss)
+            step_loss = 0.0
             if log and (step % 20 == 0 or step == 1):
-                log.write(json.dumps({"step": step, "loss": loss.item() * accum, "lr": sched.get_last_lr()[0],
-                                      "elapsed_s": time.time() - t_start}) + "\n")
+                # loss: mean over the full batch of this step (all micro-batches); loss_avg20: mean of the last 20
+                # optimizer steps. Logs before 2026-11-23 had only the last micro-batch's loss of the step.
+                log.write(json.dumps({"step": step, "loss": window[-1], "loss_avg20": sum(window) / len(window),
+                                      "lr": sched.get_last_lr()[0], "elapsed_s": time.time() - t_start}) + "\n")
                 log.flush()
+                window.clear()
             if args.save_steps and step % args.save_steps == 0 and rank == 0:
                 torch.save({n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad},
                            out / f"trainable_step{step}.pt")
