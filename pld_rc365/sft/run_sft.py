@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -131,8 +132,10 @@ def main():
                "--per-device-batch-size", str(args.per_device_batch_size), "--attn", args.attn, "--lr", str(args.lr),
                "--lora-rank", str(args.lora_rank), "--lora-alpha", str(args.lora_alpha)]
         if args.xr1_defaults:
+            # peak lr: XR-1's 2e-5 (full fine-tuning) unless PLD_SFT_PEAK_LR is set (e.g. 1e-4 for LoRA, user choice
+            # 2026-11-22); warm-up start, cosine floor, wd and seed stay XR-1's
             i = cmd.index("--lr")
-            cmd[i + 1] = "2e-5"
+            cmd[i + 1] = os.environ.get("PLD_SFT_PEAK_LR", "2e-5")
             cmd += ["--weight-decay", "0.1", "--warmup-steps", "500", "--warmup-lr-start", "5e-7", "--min-lr", "5e-6",
                     "--seed", "42"]
         cwd = REPO_ROOT
