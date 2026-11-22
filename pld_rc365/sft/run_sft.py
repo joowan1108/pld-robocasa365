@@ -59,6 +59,10 @@ def main():
                     help="micro-batch per GPU; the rest is gradient accumulation (2 is safe on 24 GB cards)")
     ap.add_argument("--attn", default="flash_attention_2", choices=["flash_attention_2", "eager"], help="XR1 only")
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--xr1-defaults", action="store_true",
+                    help="XR1 only: the XR-1 code base's post-training optimiser settings (xr1/configs/trainer/"
+                         "deepspeed.yaml, Xiaomi-Robotics-1 @0dd7aef): AdamW wd 0.1, 500-step linear warm-up "
+                         "5e-7 -> 2e-5, cosine to 5e-6, grad clip 1.0, seed 42. Overrides --lr.")
     ap.add_argument("--lora-rank", type=int, default=32)
     ap.add_argument("--lora-alpha", type=int, default=32)
     ap.add_argument("--rldx-backbone-lora-layers", type=int, default=4,
@@ -126,6 +130,11 @@ def main():
                "--global-batch-size", str(args.global_batch_size),
                "--per-device-batch-size", str(args.per_device_batch_size), "--attn", args.attn, "--lr", str(args.lr),
                "--lora-rank", str(args.lora_rank), "--lora-alpha", str(args.lora_alpha)]
+        if args.xr1_defaults:
+            i = cmd.index("--lr")
+            cmd[i + 1] = "2e-5"
+            cmd += ["--weight-decay", "0.1", "--warmup-steps", "500", "--warmup-lr-start", "5e-7", "--min-lr", "5e-6",
+                    "--seed", "42"]
         cwd = REPO_ROOT
 
     print(" ".join(cmd), flush=True)

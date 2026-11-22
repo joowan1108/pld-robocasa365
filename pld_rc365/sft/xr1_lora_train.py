@@ -166,6 +166,9 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-5)
     ap.add_argument("--warmup-ratio", type=float, default=0.05)
+    ap.add_argument("--warmup-steps", type=int, default=None, help="overrides --warmup-ratio")
+    ap.add_argument("--warmup-lr-start", type=float, default=0.0, help="lr at step 0 of the linear warm-up")
+    ap.add_argument("--min-lr", type=float, default=0.0, help="cosine floor")
     ap.add_argument("--lora-rank", type=int, default=32)
     ap.add_argument("--lora-alpha", type=int, default=32)
     ap.add_argument("--noise-repeats", type=int, default=4)
@@ -223,10 +226,12 @@ def main():
     accum = max(1, args.global_batch_size // (args.per_device_batch_size * world))
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
-    warm = int(args.warmup_ratio * args.max_steps)
+    # linear warm-up warmup_lr_start -> lr, then cosine lr -> min_lr (XR-1's mibot.utils.cosine_warmup schedule)
+    warm = int(args.warmup_steps if args.warmup_steps is not None else args.warmup_ratio * args.max_steps)
+    lo, hi, w0 = args.min_lr / args.lr, 1.0, args.warmup_lr_start / args.lr
     sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda s: (s + 1) / max(1, warm) if s < warm
-        else 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, args.max_steps - warm))))
+        opt, lambda s: (w0 + (hi - w0) * s / max(1, warm)) if s < warm
+        else lo + (hi - lo) * 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, args.max_steps - warm))))
     loss_mod = LossModule(model, args.noise_repeats)
     if ddp:
         loss_mod = torch.nn.parallel.DistributedDataParallel(loss_mod, device_ids=[dev.index],
@@ -274,7 +279,8 @@ def main():
     if rank == 0:
         model.eval()
         save_merged(model, src, out / "merged")
-        timing = {"train_loop_seconds": train_s, "total_seconds": time.time() - t_start, "steps": step,
+        timing = {"lr": args.lr, "min_lr": args.min_lr, "warmup_steps": warm, "warmup_lr_start": args.warmup_lr_start,
+                  "weight_decay": args.weight_decay, "train_loop_seconds": train_s, "total_seconds": time.time() - t_start, "steps": step,
                   "world_size": world, "global_batch_size": args.per_device_batch_size * world * accum,
                   "num_samples": len(ds), "data": args.data, "trainable_params": n_train, "lora_rank": args.lora_rank}
         (out / "sft_timing.json").write_text(json.dumps(timing, indent=2))
