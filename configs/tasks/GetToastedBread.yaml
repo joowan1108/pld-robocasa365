@@ -1,7 +1,7 @@
 task:
   env_name: GetToastedBread
-  layout_id: null        # TODO: fill from `python -m pld_rc365.stage0_baseline --sweep` (both models, base SR ~15-70%)
-  style_id: null
+  layout_id: 11          # fixed kitchen chosen 2026-11-23: XR-1 alone 7/16 (44%) there (scripts: bw2 scene_cands.sh)
+  style_id: 19
   # Per-stage specialists (paper's long-horizon real-world recipe). `wait` is base-only.
   stages: [press, wait, pick, place]
   base_only_stages: [wait]

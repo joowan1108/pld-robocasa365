@@ -1,6 +1,6 @@
 task:
   env_name: SteamInMicrowave
-  layout_id: null        # TODO: fill from `python -m pld_rc365.stage0_baseline --sweep`
-  style_id: null
+  layout_id: 40          # fixed kitchen chosen 2026-11-23: XR-1 alone 7/16 (44%) there (scripts: bw2 scene_cands.sh)
+  style_id: 26
   stages: [veg_in_bowl, bowl_in_microwave, door_closed, turned_on]
   base_only_stages: []
