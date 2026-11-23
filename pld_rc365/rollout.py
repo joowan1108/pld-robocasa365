@@ -120,6 +120,10 @@ class Runner:
         # rl.residual_hold: env steps the residual is held fixed after each decision (1 = decide every step).
         # rl.n_step: residual decisions per TD backup. Either > 1: transitions are aggregated at episode end.
         self.hold, self.n_step = 1, 1
+        # rl.max_learner_lag > 0: collection pauses while a running learner is more than this many updates behind
+        # its budget (utd * stored env steps), so the update-to-data ratio does not drop silently when many envs
+        # collect faster than the learner can train. 0 = never wait (all runs before 2026-11-23).
+        self.max_learner_lag = 0
         self._aug_gen = torch.Generator().manual_seed(0)
         try:   # FrozenBackbone encodes the views in chunks of one view; simple callables take the whole batch
             self._chunked = "chunk" in inspect.signature(getattr(backbone, "forward", backbone)).parameters
@@ -233,6 +237,7 @@ class Runner:
         while states:
             if check is not None:
                 check()
+            self._wait_for_learners(check)
             # 1. base actions: pipelined queries -- envs without an action wait, the rest keep stepping
             self.base.poll()
             self.base.submit(sorted(states))
@@ -403,6 +408,29 @@ class Runner:
                         self.venv.finish(i, False)
                     states.pop(i)
         self.base.drain()  # leave no request in flight for the next run() (envs get reset there)
+
+    def _wait_for_learners(self, check=None):
+        if not self.max_learner_lag:
+            return
+        t0 = None
+        while True:
+            lag = 0.0
+            for sp in self.spec.values():
+                ln = getattr(sp, "learner", None)
+                # a learner only trains once the online buffer has data (with a residual hold, transitions are
+                # added at episode end), and it is paused while the warm-up state is saved
+                if ln is None or not ln.is_alive() or ln.stop_flag.is_set() or len(sp.online) == 0:
+                    continue
+                lag = max(lag, ln.utd * max(sp.online.total_added, sp.agent.online_steps) - sp.agent.n_updates)
+            if lag <= self.max_learner_lag:
+                break
+            if t0 is None:
+                t0 = time.time()
+            if check is not None:
+                check()                     # a dead learner raises instead of blocking forever
+            time.sleep(0.01)
+        if t0 is not None:
+            self.stats["learner_wait_s"] = self.stats.get("learner_wait_s", 0.0) + time.time() - t0
 
     @staticmethod
     def _residual_summary(s: "_EnvState") -> dict | None:

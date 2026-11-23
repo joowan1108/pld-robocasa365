@@ -164,6 +164,7 @@ def make_runner(cfg, venv, base, backbone, specs, num_stages: int) -> Runner:
     runner.hold = max(1, int(cfg["rl"].get("residual_hold", 1)))
     runner.n_step = max(1, int(cfg["rl"].get("n_step", 1)))
     runner.aug_pad = int((cfg["residual"].get("augment") or {}).get("pad", 4))
+    runner.max_learner_lag = int(cfg["rl"].get("max_learner_lag", 0) or 0)
     return runner
 
 

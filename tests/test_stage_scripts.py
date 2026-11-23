@@ -269,3 +269,43 @@ def test_stage1_hold_gripper_off_low_temperature(patched, monkeypatch):
     alpha = float(torch.as_tensor(ck["specialists"][0]["log_alpha"]).exp())
     assert 0.005 < alpha < 0.02
     assert sorted(p.name for p in rd.glob("specialists_step*k.pt"))
+
+
+def test_xi_sequence_reuses_the_hold_run_cache(patched, monkeypatch):
+    """The sequential fixed-xi runs (2026-11-23): a run with a different xi, more envs and rl.max_learner_lag reuses
+    the offline buffer + Cal-QL critic + warm-up of the hold run, copied into another runs dir, and completes."""
+    import shutil
+    import pld_rc365.stage1_train as s1
+
+    common = ["stage1.init_seed_pool=0", "rl.critic_action=residual", "rl.utd=1.0", "rl.residual_hold=8",
+              "rl.n_step=1", "rl.init_temperature=0.01", "stage1.checkpoint_keep_every_steps=10",
+              "stage1.max_online_env_steps=60", "residual.xi_scale=[1,1,1,0,0,0,0]"]
+    runs1, runs2 = patched / "runs1", patched / "runs2"
+    monkeypatch.setattr(sys, "argv", ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--set", *TINY,
+                                      f"paths.runs_root={runs1}", *common, "residual.xi=0.1"])
+    s1.main()
+    t = "xr1/CoffeeSetupMug"
+    (runs2 / t).mkdir(parents=True)
+    shutil.copytree(runs1 / t / "offline_cache", runs2 / t / "offline_cache")
+    called = {"calql": 0}
+    from pld_rc365.rl import agent as agent_mod
+    real = agent_mod.ResidualSAC.pretrain_calql
+
+    def spy(self, *a, **k):
+        called["calql"] += 1
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(agent_mod.ResidualSAC, "pretrain_calql", spy)
+    monkeypatch.setattr(sys, "argv", ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--set", *TINY,
+                                      f"paths.runs_root={runs2}", *common, "residual.xi=0.6", "env.num_envs=4",
+                                      "rl.max_learner_lag=4", "stage1.reuse_offline=true", "stage1.reuse_warmup=true"])
+    s1.main()
+    assert called["calql"] == 0                                   # nothing recomputed
+    rd = runs2 / t / "stage1"
+    timing = json.loads((rd / "timing.json").read_text())
+    assert timing["extra"]["warmup_is_from_cache"]["actor"] == "keep"
+    eps = [json.loads(l) for l in (rd / "episodes.jsonl").read_text().splitlines()]
+    assert {e["phase"] for e in eps} >= {"warmup", "online", "final_eval"}
+    res = [e["residual"] for e in eps if e["phase"] == "online" and e.get("residual")]
+    assert res and all(r["xi"] == 0.6 and r["xi_dim"][3:] == [0, 0, 0, 0] for r in res)
+    assert (rd / "specialists_final.pt").exists()

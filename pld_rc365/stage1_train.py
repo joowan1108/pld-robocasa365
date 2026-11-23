@@ -100,7 +100,7 @@ def save_offline_cache(cache: Path, specs: dict, meta: dict) -> None:
 # Settings that do not change what Cal-QL + warm-up produce (or only marginally: xi enters the TD target through
 # pi_delta's action at s'). They are recorded in the warm-up cache but not part of its key, so e.g. a xi change
 # can reuse the critic and warm-up data.
-WARMUP_KEY_EXCLUDE_RL = {"device", "prefetch_threads", "prefetch_depth"}
+WARMUP_KEY_EXCLUDE_RL = {"device", "prefetch_threads", "prefetch_depth", "max_learner_lag"}
 WARMUP_KEY_EXCLUDE_RES = {"xi", "xi_schedule", "xi_start", "xi_ramp_steps"}
 
 

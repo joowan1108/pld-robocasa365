@@ -747,6 +747,51 @@ def test_hold8_with_residual_critic_and_gripper_off():
     assert np.isfinite(info["critic_loss"])
 
 
+def test_runner_waits_for_a_lagging_learner():
+    """rl.max_learner_lag: collection pauses until the learner is within the allowed lag of its budget; it never
+    waits while the online buffer is empty, the learner is stopped, or the option is off."""
+    import time as _time
+
+    class FakeLearner:
+        def __init__(self, sp, rate):
+            self.sp, self.rate, self.utd = sp, rate, 1.0
+            self.stop_flag = threading.Event()
+            self.error = None
+            self._t = threading.Thread(target=self._run, daemon=True)
+        def start(self): self._t.start()
+        def is_alive(self): return self._t.is_alive()
+        def _run(self):
+            while not self.stop_flag.is_set():
+                if len(self.sp.online) and self.sp.agent.n_updates < self.sp.agent.online_steps:
+                    self.sp.agent.n_updates += 1
+                _time.sleep(self.rate)
+
+    runner, venv, base, specs = make_runner(num_envs=2, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    sp = specs[0]
+    sp.agent.online_steps, sp.agent.n_updates = 0, 0
+    max_lag = []
+    orig = runner._wait_for_learners
+    def spy(check=None):
+        orig(check)
+        if len(sp.online):
+            max_lag.append(sp.agent.online_steps - sp.agent.n_updates)
+    runner._wait_for_learners = spy
+    runner.max_learner_lag = 3
+    sp.learner = FakeLearner(sp, 0.002)
+    sp.learner.start()
+    run_n(runner, [EpisodeSpec(seed=i, mode="base", store="online") for i in range(4)], 4)
+    assert sp.agent.online_steps == 48
+    assert max(max_lag) <= 3 and runner.stats.get("learner_wait_s", 0) > 0
+    sp.learner.stop_flag.set()
+    # stopped learner / option off: no waiting (would block forever otherwise)
+    run_n(runner, [EpisodeSpec(seed=9, mode="base", store="online")], 1)
+    assert sp.agent.online_steps == 60 and sp.agent.n_updates < 60
+    runner.max_learner_lag = 0
+    sp.learner = None
+    run_n(runner, [EpisodeSpec(seed=10, mode="base", store="online")], 1)
+    assert sp.agent.online_steps == 72
+
+
 def test_base_action_bias_is_seen_and_executed():
     """base.action_bias (known-answer test): the residual sees the biased a_b, and without a residual the env executes
     the biased action."""
