@@ -132,6 +132,7 @@ stage1:
   sr_thresholds: [0.8, 0.9, 0.95]
   stop_sr: 0.95
   checkpoint_every_episodes: 200
+  checkpoint_keep_every_steps: 0   # > 0: also keep specialists_step<N>k.pt every N stored env steps (pick the best later)
   final_eval_episodes: 50
 
 stage2:

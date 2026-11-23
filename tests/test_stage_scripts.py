@@ -220,3 +220,16 @@ def test_stage1_with_residual_hold_and_n_step(patched, monkeypatch):
     d = np.load(cache / "stage0.npz")
     steps = d["steps"][: int(d["size"])]
     assert steps.max() > 1 and steps.max() <= 6
+
+
+def test_stage1_keeps_step_checkpoints(patched, monkeypatch):
+    import pld_rc365.stage1_train as s1
+
+    runs = patched / "runs"
+    monkeypatch.setattr(sys, "argv", ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--skip-final-eval", "--set",
+                                      *TINY, f"paths.runs_root={runs}", "stage1.checkpoint_keep_every_steps=10"])
+    s1.main()
+    rd = runs / "xr1" / "CoffeeSetupMug" / "stage1"
+    kept = sorted(p.name for p in rd.glob("specialists_step*k.pt"))
+    assert kept, "no kept checkpoints"
+    assert (rd / "specialists_final.pt").exists()

@@ -366,6 +366,18 @@ def main():
                         timer.mark(f"sr>={th}_since_online_start", since=t_online0)
             if state["episodes"] % int(s1["checkpoint_every_episodes"]) == 0:
                 save_specialists(specs, rd / "specialists_latest.pt", {"episodes": state["episodes"], "rolling_sr": sr})
+            # kept checkpoints every N stored env steps (stage1.checkpoint_keep_every_steps; 0 = off): the best one
+            # can be picked afterwards instead of the final one
+            keep = int(s1.get("checkpoint_keep_every_steps", 0) or 0)
+            if keep:
+                st = min(sp.agent.online_steps for sp in specs.values())
+                if st // keep > state.get("kept_ckpt", 0):
+                    state["kept_ckpt"] = st // keep
+                    name = f"specialists_step{state['kept_ckpt'] * keep // 1000:03d}k.pt"
+                    save_specialists(specs, rd / name, {"episodes": state["episodes"], "rolling_sr": sr,
+                                                        "rolling_sr_all": float(np.mean(window_all)),
+                                                        "online_steps": st})
+                    print(f"[stage1] kept checkpoint {name} (rolling takeover SR {sr:.2f})", flush=True)
             refresh_limits()
             if len(window) >= window.maxlen and sr >= limits["stop_sr"]:
                 state["stop_reason"] = f"rolling_sr>={limits['stop_sr']}"
