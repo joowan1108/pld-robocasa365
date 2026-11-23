@@ -233,3 +233,39 @@ def test_stage1_keeps_step_checkpoints(patched, monkeypatch):
     kept = sorted(p.name for p in rd.glob("specialists_step*k.pt"))
     assert kept, "no kept checkpoints"
     assert (rd / "specialists_final.pt").exists()
+
+
+def test_stage1_hold_gripper_off_low_temperature(patched, monkeypatch):
+    """The 2026-11-23 residual-hold run's overrides together, end to end on the fake env: residual held for 8 env
+    steps, Q(s, a_b, a_delta) critic, gripper residual switched off, temperature initialised at 0.01."""
+    import numpy as np
+    import torch
+    import pld_rc365.stage1_train as s1
+
+    runs = patched / "runs"
+    monkeypatch.setattr(sys, "argv", ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--set", *TINY,
+                                      f"paths.runs_root={runs}", "stage1.init_seed_pool=0", "rl.critic_action=residual",
+                                      "rl.utd=1.0", "residual.xi=0.1", "rl.residual_hold=8", "rl.n_step=1",
+                                      "rl.init_temperature=0.01", "stage1.checkpoint_keep_every_steps=10",
+                                      "stage1.max_online_env_steps=60"])
+    s1.main()
+    rd = runs / "xr1" / "CoffeeSetupMug" / "stage1"
+    cfg = json.loads((rd / "config.json").read_text())
+    assert cfg["residual"]["xi_scale"][6] == 0 and cfg["rl"]["residual_hold"] == 8 and cfg["rl"]["n_step"] == 1
+    eps = [json.loads(l) for l in (rd / "episodes.jsonl").read_text().splitlines()]
+    assert {e["phase"] for e in eps} >= {"offline", "warmup", "online", "final_eval"}
+    res = [e["residual"] for e in eps if e["phase"] in ("online", "final_eval") and e.get("residual")]
+    assert res, "no episode with residual statistics"
+    for r in res:
+        assert r["mean_abs"][6] == 0 and r["xi_dim"][6] == 0          # gripper: no residual
+        assert max(r["mean_abs"][:6]) > 0
+        assert all(a <= b + 1e-6 for a, b in zip(r["mean_abs"][:6], r["xi_dim"][:6]))
+    # the fake env's base successes last 5 steps, shorter than the hold: one transition (block) per episode
+    cache = runs / "xr1" / "CoffeeSetupMug" / "offline_cache" / ("L11_S34_n2_e16" + KEY_SUFFIX + "_h8n1")
+    d = np.load(cache / "stage0.npz")
+    assert int(d["size"]) == 2 and list(d["steps"][:2]) == [5, 5]
+    # temperature: initialised at 0.01 (this tiny run only moves it by a few small Adam steps)
+    ck = torch.load(rd / "specialists_final.pt", map_location="cpu", weights_only=False)
+    alpha = float(torch.as_tensor(ck["specialists"][0]["log_alpha"]).exp())
+    assert 0.005 < alpha < 0.02
+    assert sorted(p.name for p in rd.glob("specialists_step*k.pt"))

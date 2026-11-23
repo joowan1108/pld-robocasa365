@@ -698,6 +698,55 @@ def test_runner_holds_the_residual_and_stores_block_transitions():
     assert np.array_equal(buf.data["next_obs_id"][0], buf.data["obs_id"][2])   # s' of block 0 (n=2) is s of block 2
 
 
+def test_hold8_with_residual_critic_and_gripper_off():
+    """The 2026-11-23 residual-hold run's settings on the runner: hold 8, n_step 1, Q(s, a_b, a_delta) critic and
+    the gripper residual switched off. One decision per 8 env steps; the executed gripper action is the VLA's; the
+    critic's action input of every stored block is exactly the residual that was held (scaled to [-1, 1])."""
+    import copy
+    rl = dict(RL, critic_action="residual", init_temperature=0.01)
+    res = dict(dims=7, xi=0.1, xi_schedule="constant", xi_scale=[1, 1, 1, 0.25, 0.25, 0.25, 0])
+    venv, base = FakeVecEnv(1, 20, (100,), lambda s: False), FakeBase(1, 4)
+    agent = ResidualSAC(rl, res, FMAP, 2, device="cpu", seed=0)
+    assert abs(float(agent.log_alpha.exp()) - 0.01) < 1e-6
+    sp = Specialist(agent=agent, collector_actor=copy.deepcopy(agent.actor), actor_lock=threading.Lock(),
+                    offline=ReplayBuffer(500, (2, *FMAP), 16, 12, 7), online=ReplayBuffer(500, (2, *FMAP), 16, 12, 7))
+    runner = Runner(venv, base, FakeBackbone(), "cpu", 1, {0}, {0: sp}, residual_dims=7, gamma=0.99)
+    runner.hold, runner.n_step, runner.timeout_terminal = 8, 1, True
+    decisions = []
+    real_act = agent.act
+    def act(actor, feats, *a, **k):
+        out = real_act(actor, feats, *a, **k)
+        decisions.append(out.copy())
+        return out
+    agent.act = act
+    run_n(runner, [EpisodeSpec(seed=1, mode="pld", t_base=2, store="online")], 1)
+    assert len(decisions) == 3                                            # env steps 2, 10, 18
+    executed = np.array(venv.actions[(0, 1)])[:, :7]
+    venv2, base2 = FakeVecEnv(1, 20, (100,), lambda s: False), FakeBase(1, 4)
+    sp2 = make_spec_obj(0)
+    run_n(Runner(venv2, base2, FakeBackbone(), "cpu", 1, {0}, {0: sp2}, residual_dims=7, gamma=0.99),
+          [EpisodeSpec(seed=1, mode="base", store="none")], 1)
+    base_actions = np.array(venv2.actions[(0, 1)])[:, :7]
+    resid = executed - base_actions
+    held = np.concatenate([np.repeat(d, n, 0) for d, n in zip(decisions, (8, 8, 2))])
+    np.testing.assert_allclose(resid[2:, :6], held[:, :6], atol=1e-6)     # same residual for the whole block
+    assert np.all(held[:, 6] == 0)
+    buf = sp.online
+    assert buf.size == 3
+    np.testing.assert_allclose(buf.data["steps"][:3], [8, 8, 2])
+    np.testing.assert_allclose(buf.data["done"][:3], [0, 0, 1])
+    b = {k: torch.as_tensor(buf.data[k][:3]) for k in ("a_b", "a_bar")}
+    qa = agent._qa(b["a_b"], b["a_bar"]).numpy()
+    scale = 0.1 * np.array([1, 1, 1, 0.25, 0.25, 0.25])
+    np.testing.assert_allclose(qa[:, :6], np.concatenate(decisions)[:, :6] / scale, atol=1e-4)
+    assert np.all(qa[:, 6] == 0)
+    # gripper sent to the env = the VLA's (thresholded by the env exactly as without a residual)
+    np.testing.assert_allclose(np.array(venv.actions[(0, 1)])[:, 6], np.array(venv2.actions[(0, 1)])[:, 6])
+    # a learner update on these blocks runs (TD target discounted by gamma ** steps)
+    info = agent.update(symmetric_sample(sp.online, sp.online, 4, np.random.default_rng(0)))
+    assert np.isfinite(info["critic_loss"])
+
+
 def test_base_action_bias_is_seen_and_executed():
     """base.action_bias (known-answer test): the residual sees the biased a_b, and without a residual the env executes
     the biased action."""
