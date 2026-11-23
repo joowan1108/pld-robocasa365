@@ -554,6 +554,42 @@ def test_per_dimension_residual_bound():
     np.testing.assert_allclose(r["xi_dim"], [x * r["xi"] for x in scale], atol=1e-6)
 
 
+def test_residual_dim_switched_off():
+    """residual.xi_scale_j = 0: no residual on that dim (gripper), it is not part of log pi / the target entropy,
+    its critic input is 0, and the executed gripper action is the VLA's."""
+    import torch
+    from pld_rc365.rl.agent import ResidualSAC
+    from pld_rc365.rl.networks import combine
+    rl = {"discount": 0.99, "tau": 0.005, "batch_size": 4, "target_entropy_scale": 0.5, "hidden_dim": 16,
+          "latent_dim": 8, "num_spatial_features": 2, "num_q": 2, "lr": 3e-4, "init_temperature": 1.0,
+          "critic_action": "residual", "calql": dict(steps=5, alpha=1.0, num_samples=3)}
+    scale = [1, 1, 1, 0.25, 0.25, 0.25, 0]
+    ag = ResidualSAC(rl, {"dims": 7, "xi": 0.1, "xi_schedule": "constant", "xi_scale": scale}, (4, 2, 2), 2, device="cpu")
+    assert ag.n_active == 6 and ag.target_entropy == -3.0
+    f, p = torch.randn(32, 2, 4, 2, 2), torch.randn(32, 16)
+    ab = torch.rand(32, 12) * 2 - 1
+    torch.manual_seed(0)
+    a_d, logp = ag.actor(f, p, ab, 0.1)
+    assert torch.all(a_d[:, 6] == 0) and a_d[:, :6].abs().max() > 0
+    a_bar = combine(ab, a_d, 7)
+    assert torch.equal(a_bar[:, 6], ab[:, 6])                      # gripper = VLA action
+    qa = ag._qa(ab, a_bar)
+    assert torch.all(qa[:, 6] == 0) and torch.isfinite(qa).all() and qa.abs().max() <= 1 + 1e-5
+    # log pi ignores the switched-off dim: changing only that dim's head output leaves it unchanged
+    last = ag.actor.trunk[-1]
+    with torch.no_grad():
+        last.bias[6] += 3.0          # mean of dim 6
+        last.bias[13] += 1.0         # log-std of dim 6
+    torch.manual_seed(0)
+    a_d2, logp2 = ag.actor(f, p, ab, 0.1)
+    assert torch.allclose(logp, logp2, atol=1e-5) and torch.allclose(a_d, a_d2, atol=1e-7)
+    ag.reserve_gpu_memory(force=True)        # critic (Cal-QL) and actor losses run with the switched-off dim
+    with pytest.raises(ValueError):
+        ResidualSAC(rl, {"dims": 7, "xi": 0.1, "xi_schedule": "constant", "xi_scale": [0] * 7}, (4, 2, 2), 2, device="cpu")
+    with pytest.raises(ValueError):
+        ResidualSAC(rl, {"dims": 7, "xi": 0.1, "xi_schedule": "constant", "xi_scale": [1, 1, 1, 1, 1, 1, -1]}, (4, 2, 2), 2, device="cpu")
+
+
 def test_vecenv_watchdog_replaces_a_hung_worker():
     from pld_rc365.envs.rc365_env import VecEnv
 

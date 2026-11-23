@@ -43,7 +43,6 @@ class ResidualSAC:
         self.gamma = float(rl["discount"])
         self.tau = float(rl["tau"])
         self.batch = int(rl["batch_size"])
-        self.target_entropy = -self.act_dim * float(rl["target_entropy_scale"])
         self.xi_sched = XiSchedule(residual)
         self.online_steps = 0  # stored online transitions (budget)
         self.xi_steps = 0      # stored online transitions where the residual acted (drives the xi schedule;
@@ -59,10 +58,16 @@ class ResidualSAC:
         # actions are ~4x smaller than the position ones). |a_delta_j| <= xi * xi_scale_j.
         sc = residual.get("xi_scale")
         self.xi_scale_np = np.ones(self.act_dim, np.float32) if sc is None else np.asarray(sc, np.float32)
-        if self.xi_scale_np.shape != (self.act_dim,) or (self.xi_scale_np <= 0).any():
-            raise ValueError(f"residual.xi_scale must be {self.act_dim} positive numbers, got {sc!r}")
+        if self.xi_scale_np.shape != (self.act_dim,) or (self.xi_scale_np < 0).any() or not (self.xi_scale_np > 0).any():
+            raise ValueError(f"residual.xi_scale must be {self.act_dim} numbers >= 0 (not all 0), got {sc!r}")
         self.xi_scale = torch.as_tensor(self.xi_scale_np, device=self.device)
-        self.res_scale = (float(residual["xi"]) * self.xi_scale).clamp_min(1e-8)   # critic_action=residual input scale
+        # xi_scale_j = 0 switches the residual off on dim j (e.g. the gripper): a_delta_j is exactly 0, the dim is
+        # left out of log pi and of the target entropy (-n_active/2), and its critic input is 0.
+        self.n_active = int((self.xi_scale_np > 0).sum())
+        self.target_entropy = -self.n_active * float(rl["target_entropy_scale"])
+        # critic_action=residual input scale (1 on switched-off dims: their numerator is exactly 0)
+        self.res_scale = torch.where(self.xi_scale > 0, float(residual["xi"]) * self.xi_scale,
+                                     torch.ones_like(self.xi_scale)).clamp_min(1e-8)
         critic_base = base_dim if (bool(rl.get("critic_uses_a_b", False)) or self.critic_action == "residual") else 0
         self._arch = dict(fmap_shape=fmap_shape, n_cams=n_cams, proprio_dim=proprio_dim, base_dim=base_dim,
                           critic_base_dim=critic_base, critic_action=self.critic_action)
