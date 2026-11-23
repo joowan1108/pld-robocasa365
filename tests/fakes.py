@@ -121,11 +121,17 @@ class FakeBase:
     def drain(self):
         self.poll(block=True)
 
+    action_bias = None   # mirrors BasePolicy.action_bias
+
     def peek(self, i):
-        return self.q[i][0].copy()
+        return self._b(self.q[i][0].copy())
 
     def pop(self, i):
-        return self.q[i].popleft()
+        return self._b(self.q[i].popleft())
+
+
+    def _b(self, a):
+        return a if self.action_bias is None else a + self.action_bias
 
 
 class FakeBackbone(torch.nn.Module):

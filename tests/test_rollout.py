@@ -660,3 +660,27 @@ def test_runner_holds_the_residual_and_stores_block_transitions():
     np.testing.assert_allclose(buf.data["proprio"][:3, 0], [2, 6, 10])    # s of each transition = block start
     np.testing.assert_allclose(buf.data["next_proprio"][:3, 0], [10, 12, 12])
     assert np.array_equal(buf.data["next_obs_id"][0], buf.data["obs_id"][2])   # s' of block 0 (n=2) is s of block 2
+
+
+def test_base_action_bias_is_seen_and_executed():
+    """base.action_bias (known-answer test): the residual sees the biased a_b, and without a residual the env executes
+    the biased action."""
+    runner, venv, base, specs = make_runner(num_envs=1, horizon=8, stage_steps=(100,), succeed=lambda s: False)
+    base.action_bias = np.zeros(12, np.float32); base.action_bias[0] = 0.05
+    run_n(runner, [EpisodeSpec(seed=1, mode="base", store="online")], 1)
+    runner2, venv2, _, specs2 = make_runner(num_envs=1, horizon=8, stage_steps=(100,), succeed=lambda s: False)
+    run_n(runner2, [EpisodeSpec(seed=1, mode="base", store="online")], 1)
+    a, a0 = np.array(venv.actions[(0, 1)]), np.array(venv2.actions[(0, 1)])
+    np.testing.assert_allclose(a[:, 0] - a0[:, 0], 0.05, atol=1e-6)
+    np.testing.assert_allclose(a[:, 1:], a0[:, 1:], atol=1e-6)
+    np.testing.assert_allclose(specs[0].online.data["a_b"][:8, 0] - specs2[0].online.data["a_b"][:8, 0], 0.05, atol=1e-6)
+
+
+def test_base_policy_client_applies_action_bias():
+    import collections
+    from pld_rc365.base.client import BasePolicy
+    b = object.__new__(BasePolicy)
+    b.queues = [collections.deque([np.arange(12, dtype=np.float32)])]
+    assert np.array_equal(b.peek(0), np.arange(12))
+    b.action_bias = np.zeros(12, np.float32); b.action_bias[0] = 0.05
+    assert b.peek(0)[0] == np.float32(0.05) and b.pop(0)[0] == np.float32(0.05)

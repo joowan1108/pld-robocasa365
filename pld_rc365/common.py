@@ -78,6 +78,12 @@ def build_env_and_base(cfg: dict, scene: str = "fixed", task: str | None = None,
     b = cfg["base"]
     base = BasePolicy(host or b["host"], int(port or b["port"]), n, b["exec_steps"], b["history_indices"],
                       replicas=int(b.get("replicas", 1)))
+    if b.get("action_bias") is not None:
+        bias = np.zeros(12, np.float32)
+        vals = np.asarray(b["action_bias"], np.float32)
+        bias[: len(vals)] = vals          # env action order: eef pos 0:3, rot 3:6, gripper 6, base motion 7:11, mode 11
+        base.action_bias = bias
+        print(f"[base] KNOWN-ANSWER TEST: constant bias {vals.tolist()} added to every VLA action", flush=True)
     return venv, base, spec
 
 

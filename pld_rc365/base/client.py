@@ -119,8 +119,15 @@ class BasePolicy:
             self.submit(idxs)
             self.poll(block=True)
 
+    # base.action_bias (diagnostic "known-answer" test): a constant offset added to every action the VLA returns, as if
+    # the base policy itself were biased. The residual sees and corrects the biased action like any other a_b.
+    action_bias: np.ndarray | None = None
+
+    def _biased(self, a: np.ndarray) -> np.ndarray:
+        return a if self.action_bias is None else a + self.action_bias
+
     def peek(self, i: int) -> np.ndarray:
-        return self.queues[i][0].copy()
+        return self._biased(self.queues[i][0].copy())
 
     def pop(self, i: int) -> np.ndarray:
-        return self.queues[i].popleft()
+        return self._biased(self.queues[i].popleft())
