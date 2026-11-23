@@ -120,17 +120,19 @@ class StageMachine:
     def reset(self, env=None) -> int:
         self.stage = 0
         if env is not None:
-            self.stage = self._leading_true(env)
+            self.stage = self._advance(env)
         return self.stage
 
-    def _leading_true(self, env) -> int:
-        n = 0
-        for p in self._preds:
-            if not p(env):
-                break
+    def _advance(self, env) -> int:
+        """Sequential: only the predicate of the current stage is checked; when it fires, the next one is checked.
+        Earlier predicates need not still hold (GetToastedBread: `pick` = bread grasped, which is false again once the
+        bread is placed). Before 2026-11-23 the stage was the number of *simultaneously* true leading predicates, so
+        `place` (= env success) was never reached there: successful GetToastedBread episodes stopped at stage 3/4."""
+        n = self.stage
+        while n < len(self._preds) and self._preds[n](env):
             n += 1
         return n
 
     def update(self, env) -> int:
-        self.stage = max(self.stage, self._leading_true(env))
+        self.stage = self._advance(env)
         return self.stage

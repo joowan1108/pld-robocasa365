@@ -10,19 +10,33 @@ class Flags:
         self.v = {}
 
 
-def test_stage_machine_is_monotone_and_leading():
+def test_stage_machine_is_sequential_and_monotone():
     env = Flags()
     preds = {n: (lambda e, n=n: e.v.get(n, False)) for n in ("a", "b", "c")}
     sm = StageMachine("X", ["a", "b", "c"], preds)
     assert sm.reset(env) == 0
     env.v["b"] = True
-    assert sm.update(env) == 0           # b alone does not count: stages are leading predicates
+    assert sm.update(env) == 0           # b before a does not count
     env.v["a"] = True
-    assert sm.update(env) == 2
+    assert sm.update(env) == 2           # a then b in the same step
     env.v["a"] = False                   # e.g. gripper released after the pick stage
     assert sm.update(env) == 2           # latched
-    env.v.update(a=True, c=True)
+    env.v["c"] = True                    # final stage reached while an earlier predicate is false again
     assert sm.update(env) == 3
+
+
+def test_toasted_bread_success_reaches_last_stage():
+    # pick (grasped) is false at success time (bread on plate, gripper away); place must still count
+    env = Flags()
+    preds = {n: (lambda e, n=n: e.v.get(n, False)) for n in ("press", "wait", "pick", "place")}
+    sm = StageMachine("GetToastedBread", ["press", "wait", "pick", "place"], preds)
+    sm.reset(env)
+    for k in ("press", "wait", "pick"):
+        env.v[k] = True
+        sm.update(env)
+    assert sm.stage == 3
+    env.v.update(pick=False, place=True)
+    assert sm.update(env) == 4
 
 
 def test_unknown_task_success_only():
