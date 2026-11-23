@@ -52,6 +52,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, choices=["rldx", "xr1"])
     ap.add_argument("--n", type=int, required=True, help="PLD episodes per task (nested subset: 50/100/200)")
+    ap.add_argument("--data-name", default="pld", help="dataset family: <Task>_<data-name><n> (e.g. selfboot)")
     ap.add_argument("--tasks", nargs="+", default=list(TASKS))
     ap.add_argument("--nproc", type=int, default=8)
     ap.add_argument("--max-steps", type=int, default=10000)
@@ -80,13 +81,14 @@ def main():
     data_root = Path(cfg["paths"]["data_root"])
     if not data_root.is_absolute():
         data_root = REPO_ROOT / data_root
-    datasets = [data_root / args.model / f"{t}_pld{args.n}" / "lerobot" for t in args.tasks]
+    datasets = [data_root / args.model / f"{t}_{args.data_name}{args.n}" / "lerobot" for t in args.tasks]
     for d in datasets:
         if not (d / "meta" / "info.json").exists() and not args.dry_run:
             raise FileNotFoundError(f"missing stage-2 dataset {d}")
     out = Path(cfg["paths"]["runs_root"])
     # pooled 3-task run -> pld<N>; task subset (e.g. experiment 1) -> pld<N>_<Task>[+<Task>] so they never collide
-    name = f"pld{args.n}" if sorted(args.tasks) == sorted(TASKS) else f"pld{args.n}_" + "+".join(args.tasks)
+    dn = f"{args.data_name}{args.n}"
+    name = dn if sorted(args.tasks) == sorted(TASKS) else f"{dn}_" + "+".join(args.tasks)
     out = (out if out.is_absolute() else REPO_ROOT / out) / args.model / "_sft" / name
     out.mkdir(parents=True, exist_ok=True)
 
