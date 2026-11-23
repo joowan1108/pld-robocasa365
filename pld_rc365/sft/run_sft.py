@@ -140,6 +140,12 @@ def main():
             cmd[i + 1] = os.environ.get("PLD_SFT_PEAK_LR", "2e-5")
             cmd += ["--weight-decay", "0.1", "--warmup-steps", "500", "--warmup-lr-start", "5e-7", "--min-lr", "5e-6",
                     "--seed", "42"]
+            # kept checkpoints and convergence stop (user request 2026-11-23; not used for the pld50 run):
+            # trainable weights every PLD_SFT_SAVE_STEPS steps; stop when the 500-step mean loss has not improved by 2%
+            # for 2000 steps (PLD_SFT_EARLY_STOP=0 to disable)
+            cmd += ["--save-steps", os.environ.get("PLD_SFT_SAVE_STEPS", "1000")]
+            if os.environ.get("PLD_SFT_EARLY_STOP", "1") != "0":
+                cmd += ["--es-window", "500", "--es-patience", "2000", "--es-min-delta", "0.02", "--es-min-steps", "2000"]
         cwd = REPO_ROOT
 
     print(" ".join(cmd), flush=True)

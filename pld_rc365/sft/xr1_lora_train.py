@@ -175,6 +175,12 @@ def main():
     ap.add_argument("--crop-ratio", type=float, default=0.95)
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--save-steps", type=int, default=0, help="0 = only final")
+    # early stop when the training loss has converged: the mean batch loss of a window of --es-window steps has not
+    # improved by more than --es-min-delta (relative) on the best window for --es-patience steps (after --es-min-steps)
+    ap.add_argument("--es-window", type=int, default=0, help="0 = no early stop")
+    ap.add_argument("--es-patience", type=int, default=2000)
+    ap.add_argument("--es-min-delta", type=float, default=0.02)
+    ap.add_argument("--es-min-steps", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dry-run-steps", type=int, default=0, help=">0: overfit sanity check on the first batch")
     args = ap.parse_args()
@@ -240,6 +246,7 @@ def main():
     log = open(out / f"train_rank{rank}.jsonl", "a") if rank == 0 else None
     step, epoch, t_loop = 0, 0, time.time()
     step_loss, window = 0.0, []
+    es = {"cur": [], "best": None, "best_step": 0, "history": [], "stopped": None}
     fixed_batch = None
     model.train()
     while step < args.max_steps:
@@ -264,6 +271,16 @@ def main():
             opt.zero_grad(set_to_none=True)
             step += 1
             window.append(step_loss)
+            if args.es_window:
+                es["cur"].append(step_loss)
+                if len(es["cur"]) >= args.es_window:
+                    m = sum(es["cur"]) / len(es["cur"])
+                    es["cur"].clear()
+                    es["history"].append([step, m])
+                    if es["best"] is None or m < es["best"] * (1 - args.es_min_delta):
+                        es["best"], es["best_step"] = m, step
+                    if step >= args.es_min_steps and step - es["best_step"] >= args.es_patience:
+                        es["stopped"] = step
             step_loss = 0.0
             if log and (step % 20 == 0 or step == 1):
                 # loss: mean over the full batch of this step (all micro-batches); loss_avg20: mean of the last 20
@@ -275,10 +292,23 @@ def main():
             if args.save_steps and step % args.save_steps == 0 and rank == 0:
                 torch.save({n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad},
                            out / f"trainable_step{step}.pt")
+            stop_now = es["stopped"] is not None
+            if ddp:   # every rank stops at the same step
+                flag = torch.tensor([1.0 if stop_now else 0.0], device=dev)
+                dist.broadcast(flag, 0)
+                stop_now = bool(flag.item())
+            if stop_now:
+                if log:
+                    log.write(json.dumps({"step": step, "early_stop": True, "best_window_loss": es["best"],
+                                          "best_step": es["best_step"]}) + "\n")
+                    log.flush()
+                    print(f"[sft] early stop at step {step}: window loss has not improved by "
+                          f"{args.es_min_delta:.0%} since step {es['best_step']} ({es['best']:.5f})", flush=True)
+                break
             if step >= args.max_steps or (args.dry_run_steps and step >= args.dry_run_steps):
                 break
         epoch += 1
-        if args.dry_run_steps and step >= args.dry_run_steps:
+        if (args.dry_run_steps and step >= args.dry_run_steps) or es["stopped"] is not None:
             break
     train_s = time.time() - t_loop
     if ddp:
@@ -286,7 +316,10 @@ def main():
     if rank == 0:
         model.eval()
         save_merged(model, src, out / "merged")
-        timing = {"lr": args.lr, "min_lr": args.min_lr, "warmup_steps": warm, "warmup_lr_start": args.warmup_lr_start,
+        timing = {"early_stop": {"window": args.es_window, "patience": args.es_patience, "min_delta": args.es_min_delta,
+                                 "min_steps": args.es_min_steps, "stopped_at": es["stopped"], "best_window_loss": es["best"],
+                                 "best_step": es["best_step"], "window_means": es["history"]},
+                  "save_steps": args.save_steps, "lr": args.lr, "min_lr": args.min_lr, "warmup_steps": warm, "warmup_lr_start": args.warmup_lr_start,
                   "weight_decay": args.weight_decay, "train_loop_seconds": train_s, "total_seconds": time.time() - t_start, "steps": step,
                   "world_size": world, "global_batch_size": args.per_device_batch_size * world * accum,
                   "num_samples": len(ds), "data": args.data, "trainable_params": n_train, "lora_rank": args.lora_rank}
