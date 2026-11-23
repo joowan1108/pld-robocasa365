@@ -126,7 +126,11 @@ def main():
                "--experiment-name", f"pld_sft_pld{args.n}"]
         cwd = repo
     else:
-        cmd = [args.python, "-m", "torch.distributed.run", f"--nproc_per_node={args.nproc}",
+        import socket
+        with socket.socket() as so:   # free rendezvous port: several SFT runs can share a machine
+            so.bind(("127.0.0.1", 0))
+            port = so.getsockname()[1]
+        cmd = [args.python, "-m", "torch.distributed.run", f"--nproc_per_node={args.nproc}", f"--master_port={port}",
                "-m", "pld_rc365.sft.xr1_lora_train",
                "--data", *map(str, datasets), "--out", str(out),
                "--model-path", base_model, "--max-steps", str(args.max_steps),
