@@ -28,10 +28,15 @@ LOG_STD_MIN, LOG_STD_MAX = -20.0, 2.0
 
 
 class FrozenBackbone(nn.Module):
-    def __init__(self, name: str = "resnet10t.c3_in1k", pretrained: bool = True):
+    def __init__(self, name: str = "resnet10t.c3_in1k", pretrained: bool = True, half: bool = False):
+        """half (residual.backbone_fp16): on CUDA, run the frozen network under fp16 autocast in channels_last memory
+        format (RTX 4090, 1536 images of 256 px per learner update: 207 -> 106 ms; mean feature difference 0.2%).
+        Collection and learner use the same backbone, so the actor sees the same features in both."""
         super().__init__()
         import timm
 
+        self.half = bool(half)
+        self._channels_last = False
         self.net = timm.create_model(name, pretrained=pretrained, num_classes=0, global_pool="")
         self.net.eval()
         for p in self.net.parameters():
@@ -47,11 +52,18 @@ class FrozenBackbone(nn.Module):
         """images: (B, n_cam, H, W, 3) uint8 -> (B, n_cam, C, h, w) float16. `chunk`: max samples per forward pass
         (bounds the activation memory when many augmented views are encoded at once)."""
         B, n = images_uint8.shape[:2]
+        half = self.half and images_uint8.is_cuda
+        if half and not self._channels_last:
+            self.net.to(memory_format=torch.channels_last)
+            self._channels_last = True
         outs = []
         for a in range(0, B, chunk or max(B, 1)):
             x = images_uint8[a:a + (chunk or B)].flatten(0, 1).permute(0, 3, 1, 2).float().div_(255.0)
             x = (x - self.mean) / self.std
-            outs.append(self.net(x).half())
+            if half:
+                x = x.contiguous(memory_format=torch.channels_last)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=half):
+                outs.append(self.net(x).half().contiguous())
         f = torch.cat(outs, 0) if len(outs) != 1 else outs[0]
         return f.view(B, n, *f.shape[1:])
 

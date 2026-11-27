@@ -92,7 +92,7 @@ def build_env_and_base(cfg: dict, scene: str = "fixed", task: str | None = None,
 
 def build_backbone(cfg: dict) -> tuple[FrozenBackbone, tuple, int]:
     dev = cfg["rl"]["device"]
-    bb = FrozenBackbone().to(dev)
+    bb = FrozenBackbone(half=bool(cfg["residual"].get("backbone_fp16", False))).to(dev)
     n_cams = len(cfg["residual"]["cameras"])
     s = int(cfg["residual"]["image_size"])
     with torch.no_grad():

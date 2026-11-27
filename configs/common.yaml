@@ -87,6 +87,9 @@ residual:
     pad: 4
     views: 4                 # mode stored only (0 = no augmentation, all runs before 2026-11-21)
     encode_chunk: 128        # mode online: samples per backbone pass in the learner (bounds activation memory)
+  backbone_fp16: true        # frozen ResNet-10 under fp16 autocast + channels_last on CUDA (2026-11-27, user: option A).
+                             # RTX 4090: one learner update's 1536 images 207 -> 106 ms (learner 4.2 upd/s in fp32);
+                             # mean feature difference 0.2%. Used for collection and learner alike. false = fp32.
 
 rl:                          # Table 5
   batch_size: 256
