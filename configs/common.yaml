@@ -33,9 +33,11 @@ residual:
                              # std 0.32-0.37 / 0.09-0.10). With a linear ramp to 0.5 the learned residual was 2-4x the
                              # VLA action on position and 4-10x on rotation, 36-57% at the bound, and takeover SR fell
                              # from a 0.62 base-only baseline to 0.14 (XR1 x CoffeeSetupMug, first run). Chosen: 0.1.
-  xi_scale: null             # null = one bound xi on all 7 dims (the paper's 7-DoF residual; user 2026-11-27: "그냥
-                             # 논문대로 하자", together with residual_hold 1, critic Q(s, a_bar), temperature 1.0, full
-                             # proprio and no privileged critic). Per-dim multipliers, 0 = residual off on that dim.
+  xi_scale: [1, 1, 1, 0.3, 0.3, 0.3, 0]
+                             # per-dim multipliers of xi (dx dy dz, rx ry rz, gripper), 0 = residual off on that dim.
+                             # Since 2026-11-27 (user: paper setup, plus the rotation bound of the h8rot03 run and
+                             # the gripper residual off for now): position xi, rotation 0.3 xi, gripper the VLA's.
+                             # null = one bound on all 7 dims (the paper's 7-DoF residual).
                              # 2026-11-23 .. 11-27 (user decision then): [1,1,1,0,0,0,0], the residual acted
                              # on the end-effector position only; end-effector rotation and gripper are the VLA's (the
                              # ENPIRE PLD runtime's experiments also learn 3-D position only). The mobile base, torso
@@ -50,7 +52,11 @@ residual:
                              # The paper does not say in which action space xi is defined; the unofficial
                              # implementation adds the residual in q01/q99-normalised action space, which has the
                              # same effect. null = same bound for every dim.
-  proprio: null              # proprio components the residual actor and critic see; null = all 16 entries
+  proprio: [end_effector_position_relative, end_effector_rotation_relative]
+                             # since 2026-11-27 (user): the ACTOR sees only the proprio of the dims its residual acts
+                             # on (eef position + rotation); the critic sees all 16 (rl.critic_proprio).
+                             # proprio components the residual actor (and, without rl.critic_proprio, the critic) see;
+                             # null = all 16 entries
                              # (base_position 3, base_rotation 4, end_effector_position_relative 3,
                              # end_effector_rotation_relative 4, gripper_qpos 2; every run before 2026-11-24).
                              # [end_effector_position_relative] = only what the residual acts on (xi_scale: eef xyz).
@@ -104,8 +110,12 @@ rl:                          # Table 5
                              # run in eval mode). 0 for every run before 2026-11-27.
   critic_uses_a_b: false     # paper Eq. 2: critic Q(s, a_bar), a_b is an input of the actor only. true = Q(s, a_b, a_bar)
                              # (the first three XR1 runs; must be true to load their checkpoints)
-  critic_action: total       # total = Q(s, a_bar) (paper Eq. 2). residual = Q(s, a_b, a_delta): a_b is critic state, the action
-                             # input is the applied residual / xi (base-only data has exactly 0). Deviates from the paper.
+  critic_action: residual    # total = Q(s, a_bar) (paper Eq. 2). residual = Q(s, a_b, a_delta): a_b is critic state, the action
+                             # input is the applied residual / xi (base-only data has exactly 0). Deviates from the paper;
+                             # default since 2026-11-27 (user: the critic takes a_b and the residual separately).
+  critic_proprio: [base_position, base_rotation, end_effector_position_relative, end_effector_rotation_relative, gripper_qpos]
+                             # the critic's proprio: all 16 state entries (user 2026-11-27), no privileged sim state
+                             # (env.privileged off: no asymmetric critic). null = same selection as the actor.
   backup_entropy: false      # SERL default
   timeout_terminal: true     # time limit without success = failed episode, terminal for the critic (paper 2.1: "an
                              # episode terminates and resets on task success with a restricted time limit ... a reward
@@ -114,7 +124,8 @@ rl:                          # Table 5
   residual_hold: 1           # env steps the residual is held fixed after each decision (1 = decide every step,
                              # as in the paper). > 1: one transition per block, reward summed, bootstrap gamma^steps.
   n_step: 1                  # residual decisions per TD backup (1 = the paper's 1-step TD, Eq. 2)
-  utd: 2.0                   # critic updates per stored online transition (async learner throttle). With
+  utd: 1.0                   # (user 2026-11-27: 1; 2.0 from 11-21, but the h8* runs used 1.0 too)
+                             # critic updates per stored online transition (async learner throttle). With
                              # critic_actor_ratio 2 this is 2 critic + 1 actor/temperature update per transition, the
                              # per-cycle pattern of the unofficial implementation (utd: 2). The paper gives no value
                              # (SERL's learner is asynchronous and unthrottled). 1.0 was used until 2026-11-21.
@@ -123,6 +134,8 @@ rl:                          # Table 5
                              # reached only ~0.6 updates per stored transition)
   prefetch_depth: 2          # ready batches kept on the GPU (~100 MB each with 3 cameras at 256 px)
   actor_sync_every: 50       # learner steps between actor weight pushes to the collector
+  max_learner_lag: 512       # collection pauses while the learner is > 512 updates behind utd * stored steps, so the
+                             # update-to-data ratio holds with many envs (the h8* runs; 0 = never wait)
   offline_successes: 50      # n in Alg. 1
   calql:
     steps: 20000
@@ -156,14 +169,16 @@ stage1:
   # warm-up seconds). warmup_cache_actor: keep (identical to an uninterrupted run) | reset (fresh actor+temperature).
   reuse_warmup: false
   warmup_cache_actor: keep
-  max_online_env_steps: 250000   # stored online transitions (paper: 250k online steps). This, stop_sr and max_wall_hours
+  max_online_env_steps: 400000   # user 2026-11-27: 400k (paper: 250k online steps). Includes the warm-up.
+                                 # stored online transitions. This, stop_sr and max_wall_hours
                                  # can be changed during a run: write them to <run dir>/stage1/control.json.
-  max_wall_hours: 48
+  max_wall_hours: 100
   sr_window: 100                 # Fig. 5 sliding window
   sr_thresholds: [0.8, 0.9, 0.95]
-  stop_sr: 0.95
+  stop_sr: 2.0                   # > 1 = never stop early: the full max_online_env_steps budget is trained (as the h8*
+                                 # runs; the paper trains a fixed budget). 0.95 until 2026-11-27.
   checkpoint_every_episodes: 200
-  checkpoint_keep_every_steps: 0   # > 0: also keep specialists_step<N>k.pt every N stored env steps (pick the best later)
+  checkpoint_keep_every_steps: 10000   # (user: keep every 10k) > 0: also keep specialists_step<N>k.pt every N stored env steps (pick the best later)
   final_eval_episodes: 50
 
 stage2:
