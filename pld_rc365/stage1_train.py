@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .common import (aug_views, build_backbone, build_env_and_base, build_specialists, common_argparser, learnable_stage_ids,
+from .common import (aug_online, aug_views, build_backbone, build_env_and_base, build_specialists, common_argparser, learnable_stage_ids,
                      make_runner, sample_t_base, save_specialists, sync_collectors)
 from .config import REPO_ROOT, load_config, run_dir
 from .rl.agent import AsyncLearner
@@ -59,9 +59,13 @@ def offline_cache_dir(cfg: dict, spec, n_off: int) -> Path:
         key += f"_c{len(cfg['residual']['cameras'])}"
     if aug_views(cfg):
         key += f"_v{aug_views(cfg)}p{int(cfg['residual']['augment'].get('pad', 4))}"
+    if aug_online(cfg):                              # buffers hold raw images (shifted by the learner); the shift
+        key += "_img"                                # range is not part of what is stored
     hold, nst = int(cfg.get("rl", {}).get("residual_hold", 1)), int(cfg.get("rl", {}).get("n_step", 1))
     if hold > 1 or nst > 1:                          # stored transitions are block / n-step aggregates
         key += f"_h{hold}n{nst}"
+    if cfg["env"].get("privileged", False):          # stored proprio carries the privileged sim state (29 entries)
+        key += "_priv"
     return root / cfg["model_name"] / cfg["task_name"] / "offline_cache" / key
 
 
@@ -76,6 +80,7 @@ def offline_meta(cfg: dict, spec, fmap_shape, n_cams: int, n_off: int) -> dict:
         "offline_seed_base": int(cfg["seeds"]["offline"]),
         **({"init_seed_pool": len(init_seed_pool(cfg))} if init_seed_pool(cfg) else {}),
         **({"augment": dict(cfg["residual"]["augment"])} if aug_views(cfg) else {}),
+        **({"stores": "images"} if aug_online(cfg) else {}),
         # only when not 1/1, so buffers written before these options existed still match
         **({"residual_hold": int(cfg["rl"].get("residual_hold", 1)), "n_step": int(cfg["rl"].get("n_step", 1))}
            if int(cfg["rl"].get("residual_hold", 1)) > 1 or int(cfg["rl"].get("n_step", 1)) > 1 else {}),
@@ -113,7 +118,10 @@ def warmup_meta(cfg: dict, offline_src: dict) -> dict:
         # critic_action is left out at its default so warm-up caches written before the option existed still match
         "rl": {k: v for k, v in cfg["rl"].items()
                if k not in WARMUP_KEY_EXCLUDE_RL and not (k == "critic_action" and v == "total")},
-        "residual": {k: v for k, v in cfg["residual"].items() if k not in WARMUP_KEY_EXCLUDE_RES},
+        # residual.proprio is left out at its default (null = all) so caches written before the option still match;
+        # a selection changes the critic's shape, so it is part of the key then
+        "residual": {k: v for k, v in cfg["residual"].items()
+                     if k not in WARMUP_KEY_EXCLUDE_RES and not (k in ("proprio", "base_dims") and v is None)},
         "warmup_seed_base": int(cfg["seeds"]["warmup"]),
         **({"init_seed_pool": len(init_seed_pool(cfg))} if init_seed_pool(cfg) else {}),
         "stage_ids": sorted(int(k) for k in learnable_stage_ids(cfg)),
@@ -179,7 +187,7 @@ def main():
     timer.set("probing_alpha", cfg["probing"]["alpha"])
     backbone, fmap_shape, n_cams = build_backbone(cfg)
     stage_ids = learnable_stage_ids(cfg)
-    specs = build_specialists(cfg, fmap_shape, n_cams, stage_ids)
+    specs = build_specialists(cfg, fmap_shape, n_cams, stage_ids, backbone=backbone)
     for sp in specs.values():
         sp.agent.reserve_gpu_memory()
     runner = make_runner(cfg, venv, base, backbone, specs, K)
@@ -408,7 +416,7 @@ def main():
         # ------------------------------------------------------------ clean evaluation of pi_bar
         if not args.skip_final_eval:
             n_eval = int(s1["final_eval_episodes"])
-            runner.aug_views = 0   # evaluation stores nothing: no augmented views to encode
+            runner.aug_views, runner.store_images = 0, False   # evaluation stores nothing: no augmented views to encode
             pool = init_seed_pool(cfg)
             eseeds = iter([pool[j % len(pool)] for j in range(n_eval)] if pool else
                           range(cfg["eval"]["seed_base"], cfg["eval"]["seed_base"] + n_eval))

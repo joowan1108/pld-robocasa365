@@ -10,8 +10,9 @@ Transition = (feat, proprio, a_b, a_bar, r, done, next_feat, next_proprio, next_
 Image features live in a frame store: every observation is stored once and transitions point to it (s_{t+1} of one
 transition is s_t of the next). A frame holds `views` versions of the frozen-encoder feature maps: with image
 augmentation these are the features of `views` randomly shifted copies of the frame, and sampling picks one per
-camera, independently for s and s'. Arrays are allocated with np.zeros (lazily committed by the OS), so memory grows
-with what is stored.
+camera, independently for s and s'. With residual.augment.mode = online the store instead keeps the raw uint8 residual
+images (n_cam, H, W, 3) of every frame, and the learner shifts and encodes them anew for every batch (SERL / DrQ).
+Arrays are allocated with np.zeros (lazily committed by the OS), so memory grows with what is stored.
 """
 
 from __future__ import annotations
@@ -30,20 +31,25 @@ DEFAULTS = {"steps": 1.0}   # env steps between s and s' (the TD target discount
 class FrameRef:
     """Encoder features of one observation, shape (n, n_cam, C, h, w). n = 1: the plain frame. n = 1 + K: the plain
     frame at index 0 (used to act) followed by K augmented views (the ones a buffer with views=K stores).
+    `images`: the raw uint8 residual images (n_cam, H, W, 3), kept when the buffers store images (augment online).
     `slots` remembers where each buffer stored it, so a frame shared by two transitions is stored once."""
 
-    __slots__ = ("data", "slots")
+    __slots__ = ("data", "images", "slots")
 
-    def __init__(self, data: np.ndarray):
+    def __init__(self, data: np.ndarray, images: np.ndarray | None = None):
         self.data = data
+        self.images = images
         self.slots: dict[int, tuple[int, int]] = {}
 
 
 class ReplayBuffer:
     def __init__(self, capacity: int, feat_shape: tuple, proprio_dim: int, base_dim: int, act_dim: int,
-                 views: int = 1, frame_capacity: int | None = None):
+                 views: int = 1, frame_capacity: int | None = None, images: bool = False):
         self.capacity = int(capacity)
-        self.feat_shape = tuple(feat_shape)          # (n_cam, C, h, w)
+        self.feat_shape = tuple(feat_shape)          # (n_cam, C, h, w); images: (n_cam, H, W, 3)
+        self.images = bool(images)                   # store raw uint8 images instead of encoder features
+        if self.images and int(views) > 1:
+            raise ValueError("an image buffer stores one plain copy per frame (augmentation happens in the learner)")
         self.n_cam = int(self.feat_shape[0])
         self.views = max(1, int(views))
         self.size = 0
@@ -55,7 +61,8 @@ class ReplayBuffer:
         # buffers loaded from the pre-frame-store format. A transition whose frames were overwritten is never
         # sampled (see _valid), so a too-small store costs data, not correctness.
         self.frame_capacity = int(frame_capacity or (2 * c if c <= 4096 else c + max(4096, c // 16)))
-        self.frames = np.zeros((self.frame_capacity, self.views, *self.feat_shape), dtype=np.float16)
+        self.frames = np.zeros((self.frame_capacity, self.views, *self.feat_shape),
+                               dtype=np.uint8 if self.images else np.float16)
         self._flat = self.frames.reshape(-1, *self.feat_shape[1:])          # (frame, view, cam) flattened
         self._flat_t = torch.from_numpy(self._flat)                          # same memory, for GIL-free gathers
         self.frame_ptr = 0
@@ -84,11 +91,16 @@ class ReplayBuffer:
         rec = fr.slots.get(id(self))
         if rec is not None and self.frames_added - rec[1] < self.frame_capacity:
             return rec                                       # already stored and not overwritten since
-        d = fr.data
-        if d.shape[0] == 1 + self.views and self.views > 1:
-            d = d[1:]                                        # drop the plain frame, keep the augmented views
-        elif d.shape[0] != self.views:
-            raise ValueError(f"frame has {d.shape[0]} views, buffer stores {self.views}")
+        if self.images:
+            if fr.images is None:
+                raise ValueError("image buffer: the frame carries no raw images (Runner.store_images is off)")
+            d = np.asarray(fr.images)[None]
+        else:
+            d = fr.data
+            if d.shape[0] == 1 + self.views and self.views > 1:
+                d = d[1:]                                    # drop the plain frame, keep the augmented views
+            elif d.shape[0] != self.views:
+                raise ValueError(f"frame has {d.shape[0]} views, buffer stores {self.views}")
         slot = self.frame_ptr
         self.frames[slot] = d
         rec = (slot, self.frames_added)
@@ -151,7 +163,7 @@ class ReplayBuffer:
 
     def batch_spec(self) -> dict[str, tuple[tuple, torch.dtype]]:
         spec = {k: (self.data[k].shape[1:], torch.float32) for k in SMALL}
-        spec["feat"] = spec["next_feat"] = (self.feat_shape, torch.float16)
+        spec["feat"] = spec["next_feat"] = (self.feat_shape, torch.uint8 if self.images else torch.float16)
         return spec
 
     def __len__(self):

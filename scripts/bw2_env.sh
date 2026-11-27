@@ -6,7 +6,13 @@
 export JW="${JW:-$HOME/jwjw}"
 export PLD_HOME="${PLD_HOME:-$JW/pld}"
 export GPU="${GPU:-5}"
-export CUDA_VISIBLE_DEVICES="$GPU" MUJOCO_EGL_DEVICE_ID="$GPU"
+# EGL enumerates bw2's GPUs in a different order than CUDA / nvidia-smi: EGL device i is GPU (i + 4) % 8 (checked
+# with eglQueryDeviceAttribEXT(EGL_CUDA_DEVICE_NV), xi_runs/egl_map.py, 2026-11-25). MUJOCO_EGL_DEVICE_ID=$GPU made
+# MuJoCo render on GPU 1. robosuite uses a single-digit MUJOCO_EGL_DEVICE_ID as the raw EGL index but also asserts
+# it is listed in CUDA_VISIBLE_DEVICES (robosuite/utils/binding_utils.py), so the EGL index goes to the sim workers
+# via PLD_WORKER_EGL_ID (envs/rc365_env.py _worker: hides CUDA there and sets MUJOCO_EGL_DEVICE_ID).
+export CUDA_VISIBLE_DEVICES="$GPU" PLD_WORKER_EGL_ID="${PLD_EGL_ID:-$(( (GPU + 4) % 8 ))}"
+unset MUJOCO_EGL_DEVICE_ID
 # The shared tmux server carries another user's anaconda base environment, whose __EGL_VENDOR_LIBRARY_DIRS points
 # glvnd at conda's mesa only: MuJoCo's headless EGL then finds no NVIDIA device.
 unset __EGL_VENDOR_LIBRARY_DIRS __EGL_VENDOR_LIBRARY_FILENAMES

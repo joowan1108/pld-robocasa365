@@ -33,6 +33,10 @@ def main():
     ap.add_argument("--specialists", default=None)
     ap.add_argument("--keep-raw", action="store_true", help="keep raw frame memmaps after writing LeRobot data")
     ap.add_argument("--skip-write", action="store_true")
+    ap.add_argument("--base-only", action="store_true",
+                    help="self-bootstrap data (paper's D^Base Policy): the VLA alone acts for the whole episode (no probing, "
+                         "no residual); its successes are kept. The specialists are loaded but never act.")
+    ap.add_argument("--data-name", default="pld", help="dataset family: runs/pld_data/<model>/<Task>_<data-name><n>")
     args = ap.parse_args()
     cfg = load_config(args.model, args.task, args.set)
     rd = run_dir(cfg, "stage2")
@@ -53,8 +57,8 @@ def main():
     specs = load_specialists(cfg, spec_path, fmap_shape, n_cams)
     claim_gpu_memory(backbone, specs, venv.num_envs, cfg)
     runner = make_runner(cfg, venv, base, backbone, specs, len(spec.stage_names))
-    runner.aug_views = 0   # nothing is stored here: no augmented views to encode
-    runner.keep_pure_base = bool(s2["keep_pure_base"])
+    runner.aug_views, runner.store_images = 0, False   # nothing is stored here: no augmented views to encode
+    runner.keep_pure_base = bool(s2["keep_pure_base"]) or args.base_only
     rng = np.random.default_rng(cfg["seeds"]["stage2"])
     seeds = itertools.count(cfg["seeds"]["stage2"])
     target = int(s2["target_successes"])
@@ -64,7 +68,11 @@ def main():
     timer.set("horizon", horizon)
     timer.set("probing_alpha", cfg["probing"]["alpha"])
 
+    timer.set("base_only", bool(args.base_only))
+
     def next_spec():
+        if args.base_only:
+            return EpisodeSpec(seed=next(seeds), mode="base", t_base=horizon, record=True)
         return EpisodeSpec(seed=next(seeds), mode="pld", t_base=sample_t_base(cfg, horizon, rng),
                            deterministic=bool(s2["residual_deterministic"]), record=True)
 
@@ -111,7 +119,7 @@ def main():
     for n in marks:
         if len(kept) < n:
             continue
-        out = data_root / args.model / f"{args.task}_pld{n}"
+        out = data_root / args.model / f"{args.task}_{args.data_name}{n}"
         with timer.phase(f"write_lerobot_{n}"):
             from .data.lerobot_writer import write_dataset
 

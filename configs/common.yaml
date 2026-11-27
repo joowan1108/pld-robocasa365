@@ -10,6 +10,8 @@ env:
   num_envs: 4                # parallel env worker processes. Each RoboCasa env takes ~6.5 GB host RAM and some
                              # GPU memory for EGL rendering; 4 fits a 24 GB 4090 next to XR1 + the learner.
   mujoco_gl: egl
+  # privileged: true appends 13 entries of privileged sim state (envs/rc365_env.py PRIV_STATE_ORDER) to the stored
+  # proprio for an asymmetric critic (rl.critic_proprio). Left unset here so existing cache keys still match.
   # EGL rendering of a RoboCasa kitchen (3 cams) takes ~1.15 GB of GPU memory per env (measured on a 4090).
   # When a stage starts, num_envs is capped to what fits next to whatever is already on the GPU (the VLA server).
   cap_envs_by_gpu_mem: true
@@ -45,6 +47,17 @@ residual:
                              # The paper does not say in which action space xi is defined; the unofficial
                              # implementation adds the residual in q01/q99-normalised action space, which has the
                              # same effect. null = same bound for every dim.
+  proprio: null              # proprio components the residual actor and critic see; null = all 16 entries
+                             # (base_position 3, base_rotation 4, end_effector_position_relative 3,
+                             # end_effector_rotation_relative 4, gripper_qpos 2; every run before 2026-11-24).
+                             # [end_effector_position_relative] = only what the residual acts on (xi_scale: eef xyz).
+                             # The base pose is constant within an episode but differs between seeds (y up to 0.8 m),
+                             # and the raw quaternions flip sign (q and -q) within and between episodes.
+                             # Buffers always store all 16; the selection happens in the encoder.
+  base_dims: null            # entries of the 12-D base action a_b the residual ACTOR sees (paper: pi_delta(.|s, a_b));
+                             # null = all 12 (every run before 2026-11-26). Env order: eef pos 0:3, eef rot 3:6,
+                             # gripper 6, base motion 7:11, control mode 11. [0,1,2,3,4,5] = only the eef axes the
+                             # residual acts on. The critic always sees all 12 (option B: Q(s, a_b, a_delta)).
   xi_schedule: constant      # constant | linear (paper: "tuned by a scheduler", form not given)
   xi_start: 0.1              # only for linear
   xi_ramp_steps: 50000       # only for linear: residual-acted online steps to reach xi
@@ -55,10 +68,16 @@ residual:
                              # all three RoboCasa cameras (what the VLA sees). Runs before 2026-11-21 used left +
                              # eye_in_hand only (the paper's real-robot setup: one side view + one wrist camera).
   augment:                   # DrQ / SERL random-shift image augmentation for the learner (the paper does not mention
-    views: 4                 # it; SERL and the unofficial implementation use it with pad 4). The encoder is frozen,
-    pad: 4                   # so instead of shifting images at every update, each stored frame keeps the features
-                             # of `views` copies shifted by up to +-`pad` px, and every sampled transition draws one
-                             # view per camera, independently for s and s'. views: 0 = off (all runs before).
+                             # it; SERL, ENPIRE and the unofficial implementation use it with pad 4).
+    mode: online             # online (from 2026-11-27, as SERL / ENPIRE): the buffers keep the raw uint8 residual
+                             # images and the learner draws a fresh shift of up to +-`pad` px for every sampled image
+                             # (s and s' independently) at every update, then runs the frozen backbone on the batch.
+                             # stored (runs 2026-11-21 .. 11-27): each stored frame keeps the features of `views`
+                             # copies shifted once at collection time; the learner draws one per camera, so a state
+                             # only ever appears in views^n_cam variants (64 with 4 views and 3 cameras).
+    pad: 4
+    views: 4                 # mode stored only (0 = no augmentation, all runs before 2026-11-21)
+    encode_chunk: 128        # mode online: samples per backbone pass in the learner (bounds activation memory)
 
 rl:                          # Table 5
   batch_size: 256
@@ -77,6 +96,9 @@ rl:                          # Table 5
   hidden_dim: 256
   latent_dim: 256
   num_spatial_features: 8    # SERL SpatialLearnedEmbeddings
+  encoder_dropout: 0.1       # dropout after the spatial embeddings, before the 256 bottleneck (SERL ResNet encoder and
+                             # ENPIRE: 0.1). Active in learner updates only (the collector actor and the target critic
+                             # run in eval mode). 0 for every run before 2026-11-27.
   critic_uses_a_b: false     # paper Eq. 2: critic Q(s, a_bar), a_b is an input of the actor only. true = Q(s, a_b, a_bar)
                              # (the first three XR1 runs; must be true to load their checkpoints)
   critic_action: total       # total = Q(s, a_bar) (paper Eq. 2). residual = Q(s, a_b, a_delta): a_b is critic state, the action

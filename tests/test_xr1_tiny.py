@@ -202,3 +202,64 @@ def test_batched_inference_forward_equals_per_env(tiny):
         torch.randn_like = real
     for j, o in enumerate(outs):  # every env, incl. the right-padded shorter prompts
         torch.testing.assert_close(out_b[j:j + 1].float(), o.float(), rtol=3e-2, atol=3e-2)
+
+
+def test_full_finetune_grads_and_reload(tiny, tmp_path):
+    """--mode full: input embeddings frozen, vision tower / LLM / DiT trained with gradient checkpointing; the loss
+    with checkpointing equals the loss without; the saved model reloads with the same outputs."""
+    import copy
+
+    import torch
+    from transformers import AutoModel
+
+    from pld_rc365.base.xr1_server import encode_inputs
+    from pld_rc365.sft.xr1_lora_train import (LossModule, full_ft_param_groups, make_collate, save_merged,
+                                              setup_full_finetune)
+
+    model, proc = tiny
+    m = copy.deepcopy(model).train()
+    ref = copy.deepcopy(model).train()
+    setup_full_finetune(m)
+    ref.requires_grad_(True)
+    ref.vlm.get_input_embeddings().requires_grad_(False)
+    for mod in (m, ref):          # as in main(): trainable weights fp32, frozen ones bf16, bf16 autocast
+        for p in mod.parameters():
+            if p.requires_grad:
+                p.data = p.data.float()
+    names = {n for n, p in m.named_parameters() if p.requires_grad}
+    emb = m.vlm.get_input_embeddings().weight
+    assert not emb.requires_grad
+    assert any("visual" in n for n in names) and any("dit.layers" in n for n in names)
+    groups = full_ft_param_groups(m, 0.1)
+    assert sum(len(g["params"]) for g in groups) == len(names) and groups[1]["weight_decay"] == 0.0
+    rng = np.random.default_rng(7)
+    enc = dict(encode_inputs(proc, *_sample(rng, "pick the mug"), 0.95))
+    enc["target"] = torch.randn(16, 60) * 0.1
+    enc["valid"] = torch.ones(16)
+    b = make_collate(proc.tokenizer.pad_token_id)([enc])
+    for k in ("pixel_values_videos", "state", "action_mask"):
+        b[k] = b[k].to(torch.bfloat16)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        torch.manual_seed(0)
+        loss = LossModule(m, noise_repeats=2)(b)
+        torch.manual_seed(0)
+        loss_ref = LossModule(ref, noise_repeats=2)(b)
+    torch.testing.assert_close(loss, loss_ref)          # checkpointing does not change the forward
+    loss.backward()
+    got = {n for n, p in m.named_parameters() if p.requires_grad and p.grad is not None and p.grad.abs().sum() > 0}
+    assert any("visual" in n for n in got), "vision tower gets no gradient"
+    assert any("dit.layers" in n for n in got) and any("language_model.layers.0." in n for n in got)
+    # save (bf16) and reload: same actions as the in-memory bf16 model
+    m.eval()
+    save_merged(m, Path(proc.tokenizer.name_or_path), tmp_path / "full")
+    re = AutoModel.from_pretrained(tmp_path / "full", trust_remote_code=True, attn_implementation="eager",
+                                   dtype=torch.bfloat16).eval()
+    e2 = dict(encode_inputs(proc, *_sample(np.random.default_rng(8), "pick the mug"), 0.95))
+    e2 = {k: (v.to(torch.bfloat16) if torch.is_floating_point(v) else v) for k, v in e2.items()}
+    mm = copy.deepcopy(m).to(torch.bfloat16).eval()
+    with torch.no_grad():
+        torch.manual_seed(0)
+        a = mm(**e2, num_steps=2).actions
+        torch.manual_seed(0)
+        c = re(**e2, num_steps=2).actions
+    torch.testing.assert_close(a.float(), c.float(), rtol=1e-2, atol=1e-3)

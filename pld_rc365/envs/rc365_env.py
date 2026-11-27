@@ -22,6 +22,9 @@ from typing import Any
 import numpy as np
 
 CAMERAS = ("robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand")
+PRIV_NAMES = (["t", "success", "grasped"] + [f"eef_pos_{a}" for a in "xyz"] + [f"eef_mat_{i}" for i in range(9)]
+              + ["finger_q1", "finger_q2"] + [f"obj_pos_{a}" for a in "xyz"] + [f"obj_quat_{a}" for a in "wxyz"]
+              + [f"recep_pos_{a}" for a in "xyz"])
 STATE_KEYS = {  # RLDX/gym-wrapper name -> robosuite obs key
     "end_effector_position_relative": "robot0_base_to_eef_pos",
     "end_effector_rotation_relative": "robot0_base_to_eef_quat",
@@ -38,6 +41,16 @@ DATASET_STATE_ORDER = (
     ("gripper_qpos", 2),
 )
 ACTION_DIM = 12
+# Privileged sim state appended to the stored proprio vector when env.privileged is true (asymmetric critic:
+# rl.critic_proprio may select these, the actor never does). World frame; 13 entries after the 16 state entries.
+PRIV_STATE_ORDER = (
+    ("priv_obj_rel_eef", 3),     # mug body - eef site
+    ("priv_recep_rel_obj", 3),   # coffee-machine receptacle_place_site - mug body
+    ("priv_recep_rel_eef", 3),   # receptacle - eef
+    ("priv_obj_up", 3),          # the mug's z axis (tipping)
+    ("priv_grasped", 1),         # OU.check_obj_grasped(env, "obj")
+)
+PRIV_STATE_DIM = sum(n for _, n in PRIV_STATE_ORDER)
 
 
 def threshold_discrete(action12: np.ndarray) -> np.ndarray:
@@ -64,6 +77,7 @@ class EnvSpec:
     residual_size: int = 128
     residual_cameras: tuple[str, ...] = ("robot0_agentview_left", "robot0_eye_in_hand")
     horizon: int | None = None
+    privileged: bool = False        # append PRIV_STATE_ORDER to pkt["proprio"] (16 -> 29 entries)
     extra_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
@@ -99,6 +113,11 @@ class RC365Env:
         self.record_root = Path(record_root) if record_root else None
         self._rec = None
         self.t = 0
+        # Diagnostics only (failure analysis): with PLD_PRIV_DIR set, every step's privileged sim state (PRIV_NAMES)
+        # is written per episode to $PLD_PRIV_DIR/priv_<seed>_<pid>_<n>.npz. Off by default; nothing else changes.
+        self._priv_dir = os.environ.get("PLD_PRIV_DIR") or None
+        self._priv: dict | None = None
+        self._priv_n = 0
 
     # ------------------------------------------------------------------ obs
     def _packet(self, raw: dict) -> dict:
@@ -112,12 +131,30 @@ class RC365Env:
             images[c] if images[c].shape[:2] == (rs, rs) else cv2.resize(images[c], (rs, rs), interpolation=cv2.INTER_AREA)
             for c in self.spec.residual_cameras
         ])
+        proprio = state_vector16(state)
+        if self.spec.privileged:
+            proprio = np.concatenate([proprio, self._priv_state()])
         return {
             "images": images,
             "state": state,
-            "proprio": state_vector16(state).astype(np.float32),
+            "proprio": proprio.astype(np.float32),
             "res_images": res_images,
         }
+
+    def _priv_state(self) -> np.ndarray:
+        """PRIV_STATE_ORDER (world frame). Needs a task with an "obj" and a coffee machine (CoffeeSetupMug)."""
+        from robocasa.utils import object_utils as OU
+
+        env, d = self.env, self.env.sim.data
+        cm = getattr(env, "coffee_machine", None)
+        if "obj" not in getattr(env, "obj_body_id", {}) or cm is None:
+            raise ValueError(f"env.privileged: no privileged state defined for {self.spec.task} (needs obj + coffee machine)")
+        eef = d.site_xpos[env.robots[0].eef_site_id["right"]]
+        bid = env.obj_body_id["obj"]
+        obj = d.body_xpos[bid]
+        rec = d.site_xpos[env.sim.model.site_name2id(f"{cm.naming_prefix}receptacle_place_site")]
+        up = d.body_xmat[bid].reshape(3, 3)[:, 2]
+        return np.concatenate([obj - eef, rec - obj, rec - eef, up, [float(OU.check_obj_grasped(env, "obj"))]])
 
     # ------------------------------------------------------------------ API
     def reset(self, seed: int, record: bool = False) -> dict:
@@ -139,6 +176,9 @@ class RC365Env:
         if record:
             self._open_recorder(seed)
             self._rec_obs(pkt)
+        if self._priv_dir:
+            self._flush_priv()
+            self._priv = {"seed": int(seed), "rows": [self._priv_row(success)]}
         return pkt
 
     def _env_action(self, a12: np.ndarray) -> np.ndarray:
@@ -175,7 +215,41 @@ class RC365Env:
             self._rec_action(executed)
             if not (success or self.t >= self.horizon):
                 self._rec_obs(pkt)
+        if self._priv is not None:
+            self._priv["rows"].append(self._priv_row(success))
         return pkt
+
+    # ------------------------------------------------------------------ privileged trace (diagnostics)
+    def _priv_row(self, success: bool) -> np.ndarray:
+        """One row of PRIV_NAMES (world frame). Object/receptacle entries are NaN when the task has no "obj" or no
+        coffee machine."""
+        from robocasa.utils import object_utils as OU
+
+        env, d = self.env, self.env.sim.data
+        nan3, nan4 = [np.nan] * 3, [np.nan] * 4
+        sid = env.robots[0].eef_site_id["right"]
+        eef_pos, eef_mat = d.site_xpos[sid], d.site_xmat[sid]
+        gq = [d.qpos[env.sim.model.get_joint_qpos_addr(j)] for j in ("gripper0_right_finger_joint1", "gripper0_right_finger_joint2")]
+        obj_pos, obj_quat, grasped = nan3, nan4, np.nan
+        if "obj" in getattr(env, "obj_body_id", {}):
+            bid = env.obj_body_id["obj"]
+            obj_pos, obj_quat = d.body_xpos[bid], d.body_xquat[bid]
+            grasped = float(OU.check_obj_grasped(env, "obj"))
+        rec_pos = nan3
+        cm = getattr(env, "coffee_machine", None)
+        if cm is not None:
+            rec_pos = d.site_xpos[env.sim.model.site_name2id(f"{cm.naming_prefix}receptacle_place_site")]
+        return np.concatenate([[self.t, float(success), grasped], eef_pos, eef_mat, gq, obj_pos, obj_quat,
+                               rec_pos]).astype(np.float64)
+
+    def _flush_priv(self) -> None:
+        p, self._priv = self._priv, None
+        if not p or not self._priv_dir:
+            return
+        Path(self._priv_dir).mkdir(parents=True, exist_ok=True)
+        self._priv_n += 1
+        np.savez(Path(self._priv_dir) / f"priv_{p['seed']}_{os.getpid()}_{self._priv_n}.npz",
+                 rows=np.stack(p["rows"]), names=np.array(PRIV_NAMES), seed=p["seed"])
 
     # ------------------------------------------------------------------ recording (stage 2)
     # Frames are written to a per-episode uint8 memmap on disk instead of RAM: a 3000-step
@@ -229,6 +303,7 @@ class RC365Env:
 
     def close(self):
         self._close_recorder(keep=False)
+        self._flush_priv()
         self.env.close()
 
 
@@ -239,7 +314,13 @@ def _worker(remote, parent_remote, spec_kwargs: dict, record_root: str | None, g
     limit_threads(1)  # MuJoCo stepping is single-threaded; avoid one OpenMP thread per host core per worker
     parent_remote.close()
     os.environ.setdefault("MUJOCO_GL", gl)
-    if egl_device is not None:
+    w_egl = os.environ.get("PLD_WORKER_EGL_ID")
+    if w_egl:
+        # Raw EGL device index for the sim workers (bw2: EGL order != CUDA order, see scripts/bw2_env.sh). robosuite
+        # asserts MUJOCO_EGL_DEVICE_ID is listed in CUDA_VISIBLE_DEVICES; sim workers never use CUDA, so hide it.
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = w_egl
+    elif egl_device is not None:
         # robosuite asserts MUJOCO_EGL_DEVICE_ID is listed in CUDA_VISIBLE_DEVICES when the latter is set
         cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
         if not cvd or egl_device in cvd.split(","):
@@ -388,4 +469,5 @@ def make_spec(cfg: dict, scene: str = "fixed", task: str | None = None) -> EnvSp
         residual_size=cfg["residual"]["image_size"],
         residual_cameras=tuple(cfg["residual"]["cameras"]),
         horizon=cfg["env"].get("horizon"),
+        privileged=bool(cfg["env"].get("privileged", False)),
     )

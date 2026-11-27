@@ -1,11 +1,14 @@
 """Residual actor / critic networks (PLD App. C.1, Table 5; SERL-style image encoder).
 
 * Frozen ImageNet-pretrained ResNet-10 backbone (timm `resnet10t`) -> (512, 8, 8) feature map per 256x256 camera
-  (4x4 at 128x128). Features are computed once at collection time and stored in the replay buffer (backbone is
-  frozen). Image augmentation (random shift, pad 4) is applied before the backbone at collection time: each stored
-  frame keeps the features of K shifted copies and the learner draws one per camera (residual.augment).
-* Trainable SpatialLearnedEmbeddings head per camera (SERL) -> latent 256, LayerNorm, Tanh.
-* Inputs besides images: proprio (16-D); the actor also gets the base action a_b (12-D): pi_delta(.|s, a_b).
+  (4x4 at 128x128). Image augmentation (random shift, pad 4; residual.augment):
+    mode online (SERL / DrQ / ENPIRE): the buffers keep the raw images and the learner draws a fresh shift for every
+                sampled image at every update, then runs the frozen backbone on the batch (`shift_and_encode`).
+    mode stored (runs before 2026-11-27): each stored frame keeps the features of K shifted copies computed at
+                collection time and the learner draws one per camera (only K variants per frame, ever).
+* Trainable SpatialLearnedEmbeddings head per camera (SERL) -> dropout (rl.encoder_dropout; SERL / ENPIRE 0.1) ->
+  latent 256, LayerNorm, Tanh.
+* Inputs besides images: proprio (16-D, or the subset residual.proprio); the actor also gets the base action a_b (12-D): pi_delta(.|s, a_b).
   The critic is Q(s, a_bar) as in the paper's Eq. 2 (no a_b input) unless rl.critic_uses_a_b is set.
 * 3-layer MLPs, hidden 256, LayerNorm + Tanh. Gaussian actor with tanh squashing, scaled to [-xi, xi].
 * Clipped double Q (2 heads, shared encoder), LayerNorm.
@@ -56,15 +59,30 @@ class FrozenBackbone(nn.Module):
 def random_shift(images_uint8: torch.Tensor, pad: int, generator: torch.Generator | None = None) -> torch.Tensor:
     """DrQ / SERL random-shift augmentation: pad every image by `pad` pixels (edge replication) and crop it back to
     its size at a random offset, i.e. shift by an integer in [-pad, pad] along each axis, drawn independently for
-    every image (sample and camera). images: (B, n_cam, H, W, 3) uint8 -> same shape."""
+    every image (sample and camera). images: (B, n_cam, H, W, 3) uint8 -> same shape. Without a generator the
+    shifts are drawn on the images' device."""
     B, n, H, W, _ = images_uint8.shape
     dev = images_uint8.device
-    sh = torch.randint(-pad, pad + 1, (B, n, 2), generator=generator).to(dev)
+    if generator is None:
+        sh = torch.randint(-pad, pad + 1, (B, n, 2), device=dev)
+    else:
+        sh = torch.randint(-pad, pad + 1, (B, n, 2), generator=generator).to(dev)
     rows = (torch.arange(H, device=dev)[None, None] + sh[..., 0:1]).clamp_(0, H - 1)   # (B, n, H)
     cols = (torch.arange(W, device=dev)[None, None] + sh[..., 1:2]).clamp_(0, W - 1)   # (B, n, W)
     bi = torch.arange(B, device=dev)[:, None, None, None]
     ni = torch.arange(n, device=dev)[None, :, None, None]
     return images_uint8[bi, ni, rows[:, :, :, None], cols[:, :, None, :]]
+
+
+def shift_and_encode(backbone, images_uint8: torch.Tensor, pad: int, chunk: int | None = None) -> torch.Tensor:
+    """Learner-side augmentation (residual.augment.mode = online): a fresh random shift for every image, then the
+    frozen backbone. (B, n_cam, H, W, 3) uint8 -> (B, n_cam, C, h, w) float16, the same features the actor gets
+    from an unshifted frame at collection time."""
+    x = random_shift(images_uint8, pad) if pad > 0 else images_uint8
+    try:
+        return backbone(x, chunk=chunk)
+    except TypeError:   # simple callables (test fakes) take the whole batch
+        return backbone(x)
 
 
 class SpatialLearnedEmbeddings(nn.Module):
@@ -83,18 +101,36 @@ class SpatialLearnedEmbeddings(nn.Module):
 
 class Encoder(nn.Module):
     def __init__(self, n_cams: int, fmap_shape: tuple[int, int, int], proprio_dim: int, base_action_dim: int,
-                 latent: int, num_spatial_features: int):
+                 latent: int, num_spatial_features: int, proprio_idx: tuple[int, ...] | None = None,
+                 base_idx: tuple[int, ...] | None = None, dropout: float = 0.0):
         super().__init__()
         c, h, w = fmap_shape
         self.heads = nn.ModuleList(
-            [SpatialLearnedEmbeddings(c, h, w, num_spatial_features, latent) for _ in range(n_cams)]
+            [SpatialLearnedEmbeddings(c, h, w, num_spatial_features, latent, dropout=dropout) for _ in range(n_cams)]
         )
+        # proprio_idx: the entries of the stored proprio vector the networks see (residual.proprio); None = all.
+        # Selected here so buffers and caches keep the full vector.
+        if proprio_idx is not None:
+            self.register_buffer("proprio_idx", torch.as_tensor(list(proprio_idx), dtype=torch.long), persistent=False)
+            proprio_dim = len(proprio_idx)
+        else:
+            self.proprio_idx = None
         self.proprio = nn.Sequential(nn.Linear(proprio_dim, 64), nn.LayerNorm(64), nn.Tanh())
+        # base_idx: the entries of a_b this encoder sees (residual.base_dims, actor only); None = all
+        if base_idx is not None and int(base_action_dim) > 0:
+            self.register_buffer("base_idx", torch.as_tensor(list(base_idx), dtype=torch.long), persistent=False)
+            base_action_dim = len(base_idx)
+        else:
+            self.base_idx = None
         self.base_action_dim = int(base_action_dim)  # 0 -> a_base is ignored (paper's critic Q(s, a_bar))
         self.out_dim = n_cams * latent + 64 + self.base_action_dim
 
     def forward(self, feats: torch.Tensor, proprio: torch.Tensor, a_base: torch.Tensor | None) -> torch.Tensor:
         zs = [head(feats[:, i]) for i, head in enumerate(self.heads)]
+        if self.proprio_idx is not None:
+            proprio = proprio.index_select(-1, self.proprio_idx)
+        if self.base_action_dim and self.base_idx is not None:
+            a_base = a_base.index_select(-1, self.base_idx)
         extra = [a_base] if self.base_action_dim else []
         return torch.cat(zs + [self.proprio(proprio)] + extra, dim=-1)
 

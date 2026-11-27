@@ -41,6 +41,7 @@ class EpisodeSpec:
     deterministic: bool = False   # residual mean (stage 2 / eval)
     store: str = "none"           # none | offline | online
     record: bool = False          # stage-2 frame recording
+    trace: bool = False           # keep the per-step action trace without recording frames (residual_demo)
     tag: str = ""
 
 
@@ -91,6 +92,8 @@ class _EnvState:
     base_abs: np.ndarray | None = None         # sum of |a_b[:d]| over the same steps (VLA action scale)
     res_xi: float | None = None
     res_xi_dim: np.ndarray | None = None       # per-dim bound xi * xi_scale
+    trace: list = field(default_factory=list)  # recorded episodes: per step [t, a_b[:d], a_delta[:d], acted, decided, a_b[d:]]
+    proprio_at_t_base: list | None = None      # traced episodes: proprio when step t_base is reached (branch checks)
     t0: float = field(default_factory=time.time)
 
 
@@ -117,6 +120,9 @@ class Runner:
         # Image augmentation for the learner (residual.augment): number of randomly shifted copies encoded per
         # stored frame (0 = off) and the shift range in pixels. The actor always acts on the plain frame.
         self.aug_views, self.aug_pad = 0, 4
+        # residual.augment.mode = online: frames carry their raw residual images too, which the image buffers store
+        # (the learner shifts and encodes them at every update); the actor still acts on the plain frame's features
+        self.store_images = False
         # rl.residual_hold: env steps the residual is held fixed after each decision (1 = decide every step).
         # rl.n_step: residual decisions per TD backup. Either > 1: transitions are aggregated at episode end.
         self.hold, self.n_step = 1, 1
@@ -137,8 +143,14 @@ class Runner:
     def _features(self, pkts: list[dict]) -> list[FrameRef]:
         """One FrameRef per observation: the plain frame's features (used to act) and, with augmentation on, the
         features of `aug_views` randomly shifted copies (what the replay buffers store and train on)."""
-        imgs = torch.as_tensor(np.stack([p["res_images"] for p in pkts]), device=self.device)
+        raw = np.stack([p["res_images"] for p in pkts])
+        imgs = torch.as_tensor(raw, device=self.device)
         n = imgs.shape[0]
+        if self.store_images:
+            if self.aug_views > 0:
+                raise ValueError("store_images and pre-shifted augmented views are exclusive")
+            f = self.backbone(imgs)[:, None]
+            return [FrameRef(x, images=im) for x, im in zip(f.cpu().numpy(), raw)]
         if self.aug_views > 0:
             allv = torch.cat([imgs] + [random_shift(imgs, self.aug_pad, self._aug_gen) for _ in range(self.aug_views)], 0)
             f = self.backbone(allv, chunk=n) if self._chunked else self.backbone(allv)
@@ -222,6 +234,8 @@ class Runner:
                 states.pop(i, None)
                 return
             pkt = self.venv.reset(i, sp.seed, record=sp.record)
+            pkt.setdefault("seed", sp.seed)        # lets a replaying base policy pick the episode's recorded actions
+            pkt.setdefault("t_base", int(sp.t_base))
             self.base.reset_env(i, pkt)
             ls = pkt.get("layout_style")
             states[i] = _EnvState(spec=sp, pkt=pkt, stage=pkt["stage"],
@@ -255,6 +269,18 @@ class Runner:
                       f"waiting {len(states) - len(active)}", flush=True)
                 t_log, steps_at_log = time.time(), self.stats["env_steps"]
             a_b = {i: self.base.peek(i) for i in active}
+            bad = [i for i in active if not np.all(np.isfinite(a_b[i]))]
+            if bad:   # the VLA returned a non-finite action (XR1, once in br2 2026-11-27): drop the episode, as for a
+                for i in bad:   # dead worker, instead of executing it (MuJoCo: "Nan ... in CTRL") and crashing
+                    s = states.pop(i)
+                    self.stats["nan_base_episodes"] = self.stats.get("nan_base_episodes", 0) + 1
+                    print(f"[runner] env {i}: non-finite VLA action at t={s.t}, episode dropped (seed {s.spec.seed}, "
+                          f"{s.n_stored} transitions already stored)", flush=True)
+                active = [i for i in active if i not in bad]
+                for i in bad:
+                    start(i)
+                if not active:
+                    continue
             # 2. finalise transitions waiting for next_a_b
             for i in active:
                 s = states[i]
@@ -327,6 +353,14 @@ class Runner:
             # 5. step
             stores = {i: self._stores_now(states[i]) for i in active}
             acted_residual = set(decided) | set(held)
+            for i in active:                    # recorded episodes: what the VLA and the residual did at every step
+                s = states[i]
+                if (s.spec.record or s.spec.trace) and s.t == s.spec.t_base and s.proprio_at_t_base is None:
+                    s.proprio_at_t_base = [float(v) for v in np.asarray(s.pkt["proprio"]).ravel()]
+                if s.spec.record or s.spec.trace:
+                    ad = s.held if i in acted_residual else np.zeros(self.d)
+                    s.trace.append(np.concatenate([[s.t], a_b[i][: self.d], ad,
+                                                   [float(i in acted_residual), float(i in decided)], a_b[i][self.d:]]))
             out = self.venv.step(actions)
             dead = [i for i in active if out[i].get("_dead")]
             if dead:   # the worker hung or died and was replaced (VecEnv watchdog): drop these episodes
@@ -392,13 +426,15 @@ class Runner:
                 self._flush_online(s)
                 rec_dir = None
                 if s.spec.record:
-                    keep = success and self._keep_record(s)
+                    keep = (success or self.keep_failed_records) and self._keep_record(s)
                     rec_dir = self.venv.finish(i, keep, extra_meta=self._record_meta(s))
                 res = EpisodeResult(spec=s.spec, success=success, length=s.t, stage_reached=s.stage,
                                     took_over=s.took_over, takeover_step=s.takeover_step,
                                     n_stored=s.n_stored, rec_dir=rec_dir, wall_s=time.time() - s.t0,
                                     extra={"scene": s.scene, "init": s.init,
-                                           "residual": self._residual_summary(s)})
+                                           "residual": self._residual_summary(s),
+                                           "trace": np.asarray(s.trace) if (s.spec.record or s.spec.trace) else None,
+                                           "proprio_at_t_base": s.proprio_at_t_base})
                 if on_end is not None and on_end(res):
                     stopping = True
                 start(i)
@@ -465,6 +501,7 @@ class Runner:
 
     # stage-2 hooks (overridden via attributes)
     keep_pure_base: bool = True
+    keep_failed_records: bool = False   # residual_demo: keep the recording of failed episodes too
 
     def _keep_record(self, s: _EnvState) -> bool:
         return self.keep_pure_base or s.took_over

@@ -11,8 +11,8 @@ import numpy as np
 import torch
 
 from .base.client import BasePolicy
-from .envs.rc365_env import VecEnv, make_spec
-from .rl.agent import ResidualSAC
+from .envs.rc365_env import PRIV_STATE_DIM, VecEnv, make_spec
+from .rl.agent import N_STATE, ResidualSAC, proprio_indices, proprio_names
 from .rl.buffers import ReplayBuffer
 from .rl.networks import FrozenBackbone
 from .rollout import Runner, Specialist
@@ -64,7 +64,8 @@ def cap_num_envs(cfg: dict, n: int, training: bool, recording: bool = False) -> 
 
 def build_env_and_base(cfg: dict, scene: str = "fixed", task: str | None = None, record_root: str | None = None,
                        num_envs: int | None = None, port: int | None = None, host: str | None = None,
-                       training: bool = False):
+                       training: bool = False, no_base: bool = False):
+    """no_base: build only the envs (base = None), for callers that supply their own base policy (replay)."""
     from .utils.threads import limit_threads
 
     limit_threads()
@@ -75,6 +76,8 @@ def build_env_and_base(cfg: dict, scene: str = "fixed", task: str | None = None,
     egl = os.environ.get("PLD_EGL_DEVICES")
     venv = VecEnv(spec, n, record_root=record_root, gl=cfg["env"].get("mujoco_gl", "egl"),
                   egl_devices=egl.split(",") if egl else None)
+    if no_base:
+        return venv, None, spec
     b = cfg["base"]
     base = BasePolicy(host or b["host"], int(port or b["port"]), n, b["exec_steps"], b["history_indices"],
                       replicas=int(b.get("replicas", 1)))
@@ -113,25 +116,59 @@ def claim_gpu_memory(backbone, specs: dict, num_envs: int, cfg: dict) -> None:
         sp.agent.reserve_gpu_memory()
 
 
+def aug_online(cfg: dict) -> bool:
+    """residual.augment.mode = online: buffers store raw images, the learner draws a fresh random shift per sampled
+    image at every update and encodes the batch (SERL / DrQ / ENPIRE). mode stored (default when the key is absent,
+    i.e. every run before 2026-11-27): `views` pre-shifted feature copies per frame."""
+    return str((cfg["residual"].get("augment") or {}).get("mode", "stored")) == "online"
+
+
 def aug_views(cfg: dict) -> int:
-    """Randomly shifted copies encoded and stored per frame for the learner (residual.augment.views; 0 = off)."""
+    """Randomly shifted copies encoded and stored per frame for the learner (residual.augment.views; 0 = off;
+    always 0 with mode online, where nothing is pre-shifted)."""
+    if aug_online(cfg):
+        return 0
     return int((cfg["residual"].get("augment") or {}).get("views", 0))
 
 
+def aug_pad(cfg: dict) -> int:
+    return int((cfg["residual"].get("augment") or {}).get("pad", 4))
+
+
+def proprio_dim(cfg: dict) -> int:
+    """Stored proprio entries: 16 state entries, plus the privileged sim state with env.privileged (asymmetric
+    critic; see rl.critic_proprio). A checkpoint may override it (load_specialists: rl._proprio_dim)."""
+    if cfg["rl"].get("_proprio_dim"):
+        return int(cfg["rl"]["_proprio_dim"])
+    return N_STATE + (PRIV_STATE_DIM if cfg["env"].get("privileged", False) else 0)
+
+
 def build_specialists(cfg: dict, fmap_shape: tuple, n_cams: int, stage_ids: list[int],
-                      online_capacity: int | None = None, offline_capacity: int = 200_000) -> dict[int, Specialist]:
+                      online_capacity: int | None = None, offline_capacity: int = 200_000,
+                      backbone=None) -> dict[int, Specialist]:
+    """`backbone`: the frozen image encoder; needed for training with residual.augment.mode = online (the learner
+    encodes the stored images). Inference-only callers (stage 2, eval) can leave it out."""
     rl, res = cfg["rl"], cfg["residual"]
+    pd = proprio_dim(cfg)
+    online_img = aug_online(cfg)
+    store_shape = ((n_cams, int(res["image_size"]), int(res["image_size"]), 3) if online_img
+                   else (n_cams, *fmap_shape))
     out = {}
     for k in stage_ids:
-        agent = ResidualSAC(rl, res, fmap_shape, n_cams, device=rl["device"], seed=1000 + k)
-        collector = copy.deepcopy(agent.actor).requires_grad_(False)
+        agent = ResidualSAC(rl, res, fmap_shape, n_cams, proprio_dim=pd, device=rl["device"], seed=1000 + k)
+        if online_img and backbone is not None:
+            agent.set_image_encoder(backbone, store_shape, pad=aug_pad(cfg),
+                                    chunk=(res.get("augment") or {}).get("encode_chunk"))
+        collector = copy.deepcopy(agent.actor).requires_grad_(False).eval()   # acts without dropout
         cap = int(online_capacity or rl["buffer_capacity"])
+        buf = lambda c: ReplayBuffer(c, store_shape, pd, 12, int(res["dims"]), views=aug_views(cfg),  # noqa: E731
+                                     images=online_img)
         out[k] = Specialist(
             agent=agent,
             collector_actor=collector,
             actor_lock=threading.Lock(),
-            offline=ReplayBuffer(offline_capacity, (n_cams, *fmap_shape), 16, 12, int(res["dims"]), views=aug_views(cfg)),
-            online=ReplayBuffer(cap, (n_cams, *fmap_shape), 16, 12, int(res["dims"]), views=aug_views(cfg)),
+            offline=buf(offline_capacity),
+            online=buf(cap),
         )
     return out
 
@@ -149,6 +186,27 @@ def save_specialists(specs: dict[int, Specialist], path: Path, extra: dict | Non
 def load_specialists(cfg: dict, path: Path, fmap_shape: tuple, n_cams: int) -> dict[int, Specialist]:
     ck = torch.load(path, map_location=cfg["rl"]["device"], weights_only=False)
     ids = sorted(int(k) for k in ck["specialists"])
+    # the proprio selection is part of the network shape: take it from the checkpoint, not from the run config
+    sel = {proprio_names((ck["specialists"][k].get("arch") or {}).get("proprio_idx")) for k in ck["specialists"]}
+    if len(sel) != 1:
+        raise ValueError(f"{path}: specialists use different residual.proprio selections {sel}")
+    want = next(iter(sel))
+    if proprio_indices(want) != proprio_indices(cfg["residual"].get("proprio")):
+        print(f"[load_specialists] residual.proprio = {list(want) if want else None} (from the checkpoint)", flush=True)
+        cfg = {**cfg, "residual": {**cfg["residual"], "proprio": list(want) if want else None}}
+    # asymmetric critic: the critic's input shape comes from the checkpoint too. Only the actor runs here (it never
+    # sees privileged entries), so the env does not need env.privileged for stage 2 / eval.
+    arch = ck["specialists"][ids[0]].get("arch") or {}
+    # residual.base_dims (the actor's a_b selection) is part of the actor's shape as well
+    bidx = arch.get("base_idx")
+    if (None if bidx is None else list(bidx)) != cfg["residual"].get("base_dims"):
+        print(f"[load_specialists] residual.base_dims = {None if bidx is None else list(bidx)} (from the checkpoint)",
+              flush=True)
+        cfg = {**cfg, "residual": {**cfg["residual"], "base_dims": None if bidx is None else list(bidx)}}
+    if "critic_proprio_idx" in arch or arch.get("proprio_dim", N_STATE) != N_STATE:
+        cidx = arch.get("critic_proprio_idx")
+        cfg = {**cfg, "rl": {**cfg["rl"], "_proprio_dim": int(arch.get("proprio_dim", N_STATE)),
+                             "critic_proprio": list(proprio_names(cidx)) if cidx is not None else None}}
     specs = build_specialists(cfg, fmap_shape, n_cams, ids, online_capacity=1, offline_capacity=1)
     for k in ids:
         specs[k].agent.load_state_dict(ck["specialists"][k])
@@ -161,9 +219,10 @@ def make_runner(cfg, venv, base, backbone, specs, num_stages: int) -> Runner:
                     specs, residual_dims=int(cfg["residual"]["dims"]), gamma=float(cfg["rl"]["discount"]))
     runner.timeout_terminal = bool(cfg["rl"].get("timeout_terminal", True))
     runner.aug_views = aug_views(cfg)
+    runner.store_images = aug_online(cfg)
     runner.hold = max(1, int(cfg["rl"].get("residual_hold", 1)))
     runner.n_step = max(1, int(cfg["rl"].get("n_step", 1)))
-    runner.aug_pad = int((cfg["residual"].get("augment") or {}).get("pad", 4))
+    runner.aug_pad = aug_pad(cfg)
     runner.max_learner_lag = int(cfg["rl"].get("max_learner_lag", 0) or 0)
     return runner
 

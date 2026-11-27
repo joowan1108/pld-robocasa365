@@ -65,6 +65,9 @@ def main():
                     help="XR1 only: the XR-1 code base's post-training optimiser settings (xr1/configs/trainer/"
                          "deepspeed.yaml, Xiaomi-Robotics-1 @0dd7aef): AdamW wd 0.1, 500-step linear warm-up "
                          "5e-7 -> 2e-5, cosine to 5e-6, grad clip 1.0, seed 42. Overrides --lr.")
+    ap.add_argument("--mode", default="lora", choices=["lora", "full"],
+                    help="XR1 only: lora (LoRA r=lora_rank) or full (XR-1 code base full fine-tuning)")
+    ap.add_argument("--out-suffix", default="", help="appended to the output dir name (e.g. _full)")
     ap.add_argument("--lora-rank", type=int, default=32)
     ap.add_argument("--lora-alpha", type=int, default=32)
     ap.add_argument("--rldx-backbone-lora-layers", type=int, default=4,
@@ -89,7 +92,7 @@ def main():
     # pooled 3-task run -> pld<N>; task subset (e.g. experiment 1) -> pld<N>_<Task>[+<Task>] so they never collide
     dn = f"{args.data_name}{args.n}"
     name = dn if sorted(args.tasks) == sorted(TASKS) else f"{dn}_" + "+".join(args.tasks)
-    out = (out if out.is_absolute() else REPO_ROOT / out) / args.model / "_sft" / name
+    out = (out if out.is_absolute() else REPO_ROOT / out) / args.model / "_sft" / (name + args.out_suffix)
     out.mkdir(parents=True, exist_ok=True)
 
     micro = args.per_device_batch_size * args.nproc
@@ -136,7 +139,7 @@ def main():
                "--model-path", base_model, "--max-steps", str(args.max_steps),
                "--global-batch-size", str(args.global_batch_size),
                "--per-device-batch-size", str(args.per_device_batch_size), "--attn", args.attn, "--lr", str(args.lr),
-               "--lora-rank", str(args.lora_rank), "--lora-alpha", str(args.lora_alpha)]
+               "--lora-rank", str(args.lora_rank), "--lora-alpha", str(args.lora_alpha), "--mode", args.mode]
         if args.xr1_defaults:
             # peak lr: XR-1's 2e-5 (full fine-tuning) unless PLD_SFT_PEAK_LR is set (e.g. 1e-4 for LoRA, user choice
             # 2026-11-22); warm-up start, cosine floor, wd and seed stay XR-1's
@@ -155,7 +158,7 @@ def main():
     print(" ".join(cmd), flush=True)
     if args.dry_run:
         return
-    timer = Timer(out / "timing.json", extra={"model": args.model, "n_per_task": args.n, "tasks": args.tasks,
+    timer = Timer(out / "timing.json", extra={"model": args.model, "n_per_task": args.n, "tasks": args.tasks, "mode": args.mode,
                                              "cmd": cmd, "max_steps": args.max_steps,
                                              "global_batch_size": args.global_batch_size,
                                              "per_device_batch_size": args.per_device_batch_size,

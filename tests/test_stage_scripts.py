@@ -2,21 +2,23 @@
 
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from .fakes import FakeBackbone, FakeBase, FakeVecEnv
 
-# offline-cache key suffix for the default residual input (256 px, 3 cameras, 4 augmented views, pad 4)
-KEY_SUFFIX = "_i256_c3_v4p4"
+# offline-cache key suffix for the default residual input with the fake 4 px images (3 cameras in the config,
+# buffers storing raw images for the learner's per-update augmentation)
+KEY_SUFFIX = "_i4_c3_img"
 TINY = [
     "rl.device=cpu", "rl.hidden_dim=16", "rl.latent_dim=8", "rl.num_spatial_features=2", "rl.batch_size=8",
     "rl.buffer_capacity=2000", "rl.offline_successes=2", "rl.calql.steps=3", "rl.calql.num_samples=2",
     "rl.warmup_episodes=2", "rl.actor_sync_every=2", "env.num_envs=2",
     "stage1.sr_window=4", "stage1.stop_sr=0.0", "stage1.final_eval_episodes=3", "stage1.checkpoint_every_episodes=2",
     "eval.seed_base=0", "stage2.target_successes=3", "stage2.marks=[1,3]",
-    "task.layout_id=11", "task.style_id=34",
+    "task.layout_id=11", "task.style_id=34", "residual.image_size=4",   # FakeVecEnv residual images are 4x4
 ]
 
 
@@ -247,6 +249,7 @@ def test_stage1_hold_gripper_off_low_temperature(patched, monkeypatch):
                                       f"paths.runs_root={runs}", "stage1.init_seed_pool=0", "rl.critic_action=residual",
                                       "rl.utd=1.0", "residual.xi=0.1", "rl.residual_hold=8", "rl.n_step=1",
                                       "rl.init_temperature=0.01", "stage1.checkpoint_keep_every_steps=10",
+                                      "residual.xi_scale=[1,1,1,0,0,0,0]",   # that run's position-only residual
                                       "stage1.max_online_env_steps=60"])
     s1.main()
     rd = runs / "xr1" / "CoffeeSetupMug" / "stage1"
@@ -309,3 +312,152 @@ def test_xi_sequence_reuses_the_hold_run_cache(patched, monkeypatch):
     res = [e["residual"] for e in eps if e["phase"] == "online" and e.get("residual")]
     assert res and all(r["xi"] == 0.6 and r["xi_dim"][3:] == [0, 0, 0, 0] for r in res)
     assert (rd / "specialists_final.pt").exists()
+
+
+def test_residual_demo_records_trace_and_keeps_failures(patched, monkeypatch):
+    """residual_demo: VLA-only and takeover episodes on chosen seeds; failed episodes are kept too and every kept
+    episode gets a per-step trace (t, a_b, a_delta, acted, decided) whose residual is 0 before the takeover step and
+    constant within a hold block after it."""
+    import numpy as np
+    import pld_rc365.residual_demo as demo
+    import pld_rc365.stage1_train as s1
+
+    runs = patched / "runs"
+    hold = ["stage1.init_seed_pool=0", "rl.critic_action=residual", "rl.residual_hold=4", "rl.n_step=1",
+            "residual.xi=0.2", "residual.xi_scale=[1,1,1,0,0,0,0]", "stage1.max_online_env_steps=40"]
+    monkeypatch.setattr(sys, "argv", ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--set", *TINY,
+                                      f"paths.runs_root={runs}", *hold])
+    s1.main()
+    ck = runs / "xr1" / "CoffeeSetupMug" / "stage1" / "specialists_final.pt"
+
+    made = []
+
+    def build(cfg, scene="fixed", task=None, record_root=None, num_envs=None, port=None, host=None, training=False,
+              no_base=False):
+        from .fakes import FakeBase, FakeVecEnv
+        venv = FakeVecEnv(2, horizon=12, stage_steps=(9,))
+        venv.close = lambda: None
+
+        def finish(i, keep, extra_meta=None):
+            if not keep:
+                return None
+            d = Path(record_root) / f"ep_{len(made)}"
+            d.mkdir(parents=True)
+            made.append(d)
+            return str(d)
+
+        venv.finish = finish
+        spec = SimpleNamespace(stage_names=list(cfg["task"]["stages"]), layout_id=11, style_id=34,
+                               task=cfg["task"]["env_name"])
+        return venv, (None if no_base else FakeBase(2, exec_steps=4)), spec   # replay must not need a VLA server
+
+    monkeypatch.setattr(demo, "build_env_and_base", build)
+    monkeypatch.setattr(demo, "build_backbone", lambda cfg: (FakeBackbone(), (4, 2, 2), 2))
+    monkeypatch.setattr(demo, "claim_gpu_memory", lambda *a, **k: None)
+    common = ["--model", "xr1", "--task", "CoffeeSetupMug", "--seeds", "2,3"]
+    sets = ["--set", *TINY, f"paths.runs_root={runs}", *hold]
+    monkeypatch.setattr(sys, "argv", ["demo", *common, "--tag", "vla", "--repeats", "2", *sets])
+    demo.main()
+    monkeypatch.setattr(sys, "argv", ["demo", *common, "--tag", "res", "--t-base", "0,3", "--specialists", str(ck), *sets])
+    demo.main()
+    monkeypatch.setattr(sys, "argv", ["demo", *common, "--tag", "ev", "--t-base", "0,3", "--specialists", str(ck),
+                                      "--no-record", *sets])
+    demo.main()
+    dd = runs / "xr1" / "CoffeeSetupMug" / "demo"
+    ev = [json.loads(l) for l in (dd / "ev" / "results.jsonl").read_text().splitlines()]
+    assert len(ev) == 4 and all(r["rec_dir"] is None for r in ev)
+
+    # counterfactual replay: the VLA actions of the failed VLA-alone episode on seed 3, residual added from t_base on
+    from pld_rc365.base.replay import actions_from_trace
+    vla0 = [json.loads(l) for l in (dd / "vla" / "results.jsonl").read_text().splitlines()]
+    src = [r for r in vla0 if r["seed"] == 3 and not r["success"]][0]
+    rec = actions_from_trace(np.load(Path(src["rec_dir"]) / "trace.npy"))
+    assert rec.shape == (src["length"], 12)
+    monkeypatch.setattr(sys, "argv", ["demo", "--model", "xr1", "--task", "CoffeeSetupMug", "--seeds", "3", "--tag", "rp",
+                                      "--t-base", "0,5,999", "--replay-from", "vla", "--specialists", str(ck), *sets])
+    demo.main()
+    rp = [json.loads(l) for l in (dd / "rp" / "results.jsonl").read_text().splitlines()]
+    assert len(rp) == 3 and all(r["replay_of"] == src["rec_dir"] for r in rp)
+    for r in rp:
+        tr = np.load(Path(r["rec_dir"]) / "trace.npy")
+        ab = actions_from_trace(tr)
+        assert np.array_equal(ab, rec[: len(ab)])                  # the VLA part is exactly the recorded actions
+        acted = tr[:, 15] > 0
+        assert acted.any() == (r["t_base"] < r["length"])
+        assert not acted[: r["t_base"]].any()
+    vla = [json.loads(l) for l in (dd / "vla" / "results.jsonl").read_text().splitlines()]
+    res = [json.loads(l) for l in (dd / "res" / "results.jsonl").read_text().splitlines()]
+    assert len(vla) == 4 and len(res) == 4
+    assert {(r["seed"], r["success"]) for r in vla} == {(2, True), (3, False)}      # odd seeds fail in the fake env
+    assert all(r["rec_dir"] for r in vla + res)                                       # failures are kept too
+    for r in vla:
+        tr = np.load(Path(r["rec_dir"]) / "trace.npy")
+        assert tr.shape == (r["length"], 1 + 7 + 7 + 2 + 5) and not tr[:, 8:17].any()  # no residual at all
+    for r in res:
+        tr = np.load(Path(r["rec_dir"]) / "trace.npy")
+        t, ad, acted, decided = tr[:, 0], tr[:, 8:15], tr[:, 15], tr[:, 16]
+        assert list(t) == list(range(r["length"])) and r["takeover_step"] == r["t_base"]
+        assert not acted[t < r["t_base"]].any() and acted[t >= r["t_base"]].all()
+        assert not ad[t < r["t_base"]].any() and np.abs(ad[t >= r["t_base"]][:, :3]).max() <= 0.2 + 1e-6
+        assert not ad[:, 3:].any()                                                    # rotation / gripper switched off
+        on = np.flatnonzero(decided)
+        assert list(on) == list(range(r["t_base"], r["length"], 4))                    # one decision per hold block
+        for a in on:
+            assert np.allclose(ad[a:a + 4], ad[a])
+
+
+def test_residual_demo_branched_evaluation(patched, monkeypatch):
+    """--branch-from: per seed and t_base, both branches replay the first t_base actions of the recorded VLA episode
+    (so they reach the same state at t_base) and then query the live base policy; the 'res' branch adds the residual
+    from t_base on, the 'vla' branch never does. Pairs whose recorded episode ended before t_base are skipped."""
+    import numpy as np
+    import pld_rc365.residual_demo as demo
+    import pld_rc365.stage1_train as s1
+    from pld_rc365.base.replay import actions_from_trace
+
+    runs = patched / "runs"
+    hold = ["stage1.init_seed_pool=0", "rl.critic_action=residual", "rl.residual_hold=4", "rl.n_step=1",
+            "residual.xi=0.2", "residual.xi_scale=[1,1,1,0,0,0,0]", "stage1.max_online_env_steps=40"]
+    monkeypatch.setattr(sys, "argv", ["stage1", "--model", "xr1", "--task", "CoffeeSetupMug", "--set", *TINY,
+                                      f"paths.runs_root={runs}", *hold])
+    s1.main()
+    ck = runs / "xr1" / "CoffeeSetupMug" / "stage1" / "specialists_final.pt"
+
+    def build(cfg, scene="fixed", task=None, record_root=None, num_envs=None, port=None, host=None, training=False,
+              no_base=False):
+        from .fakes import FakeBase, FakeVecEnv
+        venv = FakeVecEnv(2, horizon=12, stage_steps=(9,))
+        venv.close = lambda: None
+        spec = SimpleNamespace(stage_names=list(cfg["task"]["stages"]), layout_id=11, style_id=34,
+                               task=cfg["task"]["env_name"])
+        return venv, FakeBase(2, exec_steps=4), spec
+
+    monkeypatch.setattr(demo, "build_env_and_base", build)
+    monkeypatch.setattr(demo, "build_backbone", lambda cfg: (FakeBackbone(), (4, 2, 2), 2))
+    monkeypatch.setattr(demo, "claim_gpu_memory", lambda *a, **k: None)
+    sets = ["--set", *TINY, f"paths.runs_root={runs}", *hold]
+    common = ["demo", "--model", "xr1", "--task", "CoffeeSetupMug", "--seeds", "2,3", "--no-record"]
+    monkeypatch.setattr(sys, "argv", [*common, "--tag", "src", *sets])
+    demo.main()
+    monkeypatch.setattr(sys, "argv", [*common, "--tag", "br", "--t-base", "0,3,10", "--branch-from", "src",
+                                      "--specialists", str(ck), *sets])
+    demo.main()
+    dd = runs / "xr1" / "CoffeeSetupMug" / "demo"
+    src = {r["seed"]: r for r in map(json.loads, (dd / "src" / "results.jsonl").read_text().splitlines())}
+    assert src[2]["length"] == 9 and src[3]["length"] == 12          # seed 2 succeeds at step 9, seed 3 times out
+    br = [json.loads(l) for l in (dd / "br" / "results.jsonl").read_text().splitlines()]
+    # seed 2 at t_base 10 is skipped (its recorded episode ended at 9): 2 seeds x 3 t_base - 1 = 5 pairs
+    assert len(br) == 10 and not [r for r in br if r["seed"] == 2 and r["t_base"] == 10]
+    pairs = {}
+    for r in br:
+        pairs.setdefault((r["seed"], r["t_base"]), {})[r["branch"]] = r
+    assert all(set(p) == {"vla", "res"} for p in pairs.values())
+    for (seed, t), p in pairs.items():
+        rec = actions_from_trace(np.load(src[seed]["trace_path"]))
+        assert p["vla"]["proprio_at_t_base"] == p["res"]["proprio_at_t_base"] is not None   # same state at t_base
+        for b, r in p.items():
+            tr = np.load(r["trace_path"])
+            assert np.array_equal(actions_from_trace(tr)[:t], rec[:t])                       # replayed prefix
+            acted = tr[:, 15] > 0
+            assert not acted[:t].any()
+            assert acted[t:].all() if b == "res" else not acted.any()

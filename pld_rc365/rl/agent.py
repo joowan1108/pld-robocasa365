@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from .buffers import BatchPrefetcher, ReplayBuffer, symmetric_sample
-from .networks import Critic, Encoder, ResidualActor, combine
+from .networks import Critic, Encoder, ResidualActor, combine, shift_and_encode
 
 
 class XiSchedule:
@@ -32,6 +32,50 @@ class XiSchedule:
             return self.xi
         frac = min(1.0, online_steps / max(1, self.ramp))
         return self.start + frac * (self.xi - self.start)
+
+
+# Stored proprio vector (envs/rc365_env.py DATASET_STATE_ORDER): component -> slice of the 16 entries.
+PROPRIO_COMPONENTS = {
+    "base_position": (0, 3),
+    "base_rotation": (3, 7),
+    "end_effector_position_relative": (7, 10),
+    "end_effector_rotation_relative": (10, 14),
+    "gripper_qpos": (14, 16),
+    # privileged sim state (env.privileged, envs/rc365_env.py PRIV_STATE_ORDER): critic only (rl.critic_proprio)
+    "priv_obj_rel_eef": (16, 19),
+    "priv_recep_rel_obj": (19, 22),
+    "priv_recep_rel_eef": (22, 25),
+    "priv_obj_up": (25, 28),
+    "priv_grasped": (28, 29),
+}
+N_STATE = 16   # entries before the privileged ones
+
+
+def proprio_indices(names) -> tuple[int, ...] | None:
+    """Indices into the stored 16-D proprio vector for the components `names` (None/null = all, i.e. no selection)."""
+    if names is None:
+        return None
+    if isinstance(names, str):
+        names = [names]
+    idx: list[int] = []
+    for n in names:
+        if n not in PROPRIO_COMPONENTS:
+            raise ValueError(f"residual.proprio: unknown component {n!r}; expected some of {list(PROPRIO_COMPONENTS)}")
+        a, b = PROPRIO_COMPONENTS[n]
+        idx += range(a, b)
+    if not idx:
+        raise ValueError("residual.proprio must name at least one component (or be null for all)")
+    return tuple(sorted(set(idx)))   # stored order, whatever order the names were given in
+
+
+def proprio_names(idx) -> tuple[str, ...] | None:
+    """Inverse of proprio_indices (None = all entries)."""
+    if idx is None:
+        return None
+    names = tuple(n for n, (a, b) in PROPRIO_COMPONENTS.items() if set(range(a, b)) <= set(idx))
+    if proprio_indices(names) != tuple(idx):
+        raise ValueError(f"proprio indices {idx} are not a list of whole components")
+    return names
 
 
 class ResidualSAC:
@@ -68,23 +112,57 @@ class ResidualSAC:
         # critic_action=residual input scale (1 on switched-off dims: their numerator is exactly 0)
         self.res_scale = torch.where(self.xi_scale > 0, float(residual["xi"]) * self.xi_scale,
                                      torch.ones_like(self.xi_scale)).clamp_min(1e-8)
+        # residual.proprio: names of the proprio components the actor and critic see (null = all 16 entries).
+        # rl.critic_proprio (asymmetric critic): the critic's own selection, may include privileged sim state
+        # (priv_* components, stored after the 16 state entries when env.privileged is true); null = same as the actor.
+        self.proprio_idx = proprio_indices(residual.get("proprio"))
+        if self.proprio_idx is not None and max(self.proprio_idx) >= N_STATE:
+            raise ValueError("residual.proprio: the actor must not see privileged state (use rl.critic_proprio)")
+        if self.proprio_idx is None and proprio_dim > N_STATE:
+            self.proprio_idx = tuple(range(N_STATE))
+        self.critic_proprio_idx = proprio_indices(rl.get("critic_proprio")) if rl.get("critic_proprio") else self.proprio_idx
+        for nm, idx in (("residual.proprio", self.proprio_idx), ("rl.critic_proprio", self.critic_proprio_idx)):
+            if idx is not None and max(idx) >= proprio_dim:
+                raise ValueError(f"{nm} selects entries {idx} but the stored proprio has {proprio_dim} "
+                                 f"(privileged components need env.privileged=true)")
         critic_base = base_dim if (bool(rl.get("critic_uses_a_b", False)) or self.critic_action == "residual") else 0
+        # residual.base_dims: entries of a_b the actor sees (null = all); the critic keeps the full a_b
+        bd = residual.get("base_dims")
+        self.base_idx = None if bd is None else tuple(int(i) for i in bd)
+        if self.base_idx is not None and (not self.base_idx or len(set(self.base_idx)) != len(self.base_idx)
+                                          or min(self.base_idx) < 0 or max(self.base_idx) >= base_dim):
+            raise ValueError(f"residual.base_dims must be distinct indices in [0, {base_dim}), got {bd!r}")
         self._arch = dict(fmap_shape=fmap_shape, n_cams=n_cams, proprio_dim=proprio_dim, base_dim=base_dim,
-                          critic_base_dim=critic_base, critic_action=self.critic_action)
+                          critic_base_dim=critic_base, critic_action=self.critic_action,
+                          proprio_idx=self.proprio_idx, critic_proprio_idx=self.critic_proprio_idx,
+                          **({"base_idx": self.base_idx} if self.base_idx is not None else {}))
         torch.manual_seed(seed)
         self.rng = np.random.default_rng(seed)
 
-        self.critic = Critic(self._make_encoder(critic_base), self.act_dim, rl["hidden_dim"], rl["num_q"]).to(self.device)
-        self.critic_targ = copy.deepcopy(self.critic).requires_grad_(False)
+        self.critic = Critic(self._make_encoder(critic_base, critic=True), self.act_dim, rl["hidden_dim"], rl["num_q"]).to(self.device)
+        self.critic_targ = copy.deepcopy(self.critic).requires_grad_(False).eval()   # eval: no dropout in the target
         self.critic_opt = torch.optim.AdamW(self.critic.parameters(), lr=rl["lr"])
         self.init_actor()
         self.n_updates = 0
+        # residual.augment.mode = online: batches carry raw uint8 images, shifted and encoded here at every update
+        # (set_image_encoder); None = batches carry precomputed features
+        self.image_backbone = None
+        self.aug_pad, self.enc_chunk, self.image_shape = 4, None, None
+
+    def set_image_encoder(self, backbone, image_shape: tuple, pad: int = 4, chunk: int | None = None) -> None:
+        """Learner-side augmentation: the frozen backbone (shared with the collector, inference only), the stored
+        image shape (n_cam, H, W, 3), the shift range and the max samples per backbone pass (activation memory)."""
+        self.image_backbone, self.image_shape = backbone, tuple(image_shape)
+        self.aug_pad, self.enc_chunk = int(pad), (int(chunk) if chunk else None)
 
     # ------------------------------------------------------------------ construction
-    def _make_encoder(self, base_dim: int | None = None) -> Encoder:
+    def _make_encoder(self, base_dim: int | None = None, critic: bool = False) -> Encoder:
         a = self._arch
+        idx = a.get("critic_proprio_idx", a.get("proprio_idx")) if critic else a.get("proprio_idx")
         return Encoder(a["n_cams"], a["fmap_shape"], a["proprio_dim"], a["base_dim"] if base_dim is None else base_dim,
-                       self.rl["latent_dim"], self.rl["num_spatial_features"])
+                       self.rl["latent_dim"], self.rl["num_spatial_features"], proprio_idx=idx,
+                       base_idx=None if critic else a.get("base_idx"),
+                       dropout=float(self.rl.get("encoder_dropout", 0.0) or 0.0))
 
     def init_actor(self):
         """Random (re-)initialisation of pi_delta and the temperature (Alg. 1: after critic pre-training)."""
@@ -101,6 +179,17 @@ class ResidualSAC:
     # ------------------------------------------------------------------ helpers
     def _to_t(self, b: dict) -> dict[str, torch.Tensor]:
         return {k: torch.as_tensor(v, device=self.device) for k, v in b.items()}
+
+    def _encode_batch(self, b: dict) -> dict:
+        """Image batches (uint8): a fresh random shift per sampled image, independently for s and s', then the
+        frozen backbone; the critic and actor updates of this step both use the result. Feature batches pass."""
+        if b["feat"].dtype != torch.uint8:
+            return b
+        if self.image_backbone is None:
+            raise RuntimeError("batch holds raw images but no image encoder is set (ResidualSAC.set_image_encoder)")
+        B = b["feat"].shape[0]
+        f = shift_and_encode(self.image_backbone, torch.cat([b["feat"], b["next_feat"]], 0), self.aug_pad, self.enc_chunk)
+        return {**b, "feat": f[:B], "next_feat": f[B:]}
 
     def _qa(self, a_b: torch.Tensor, a_bar: torch.Tensor) -> torch.Tensor:
         """Action input of the critic for the executed arm action a_bar taken on top of the base action a_b.
@@ -244,7 +333,7 @@ class ResidualSAC:
 
     # ------------------------------------------------------------------ updates
     def update(self, b_np: dict, calql_alpha: float = 0.0) -> dict:
-        b = self._to_t(b_np)
+        b = self._encode_batch(self._to_t(b_np))
         xi = self.xi
         closs, info = self.critic_loss(b, xi, calql_alpha)
         self._step(self.critic_opt, closs, self.critic.parameters())
@@ -267,14 +356,19 @@ class ResidualSAC:
         if self.device.type != "cuda" and not force:
             return
         a, B, rng = self._arch, self.batch, np.random.default_rng(0)
-        feat = (a["n_cams"], *a["fmap_shape"])
-        b = self._to_t({
-            "feat": rng.standard_normal((B, *feat)).astype(np.float16), "next_feat": rng.standard_normal((B, *feat)).astype(np.float16),
+        if self.image_backbone is not None:   # image batches: the backbone pass over 2B samples is part of the peak
+            feat, fdt = self.image_shape, torch.uint8
+            dummy = lambda: rng.integers(0, 256, (B, *feat), dtype=np.uint8)   # noqa: E731
+        else:
+            feat, fdt = (a["n_cams"], *a["fmap_shape"]), torch.float16
+            dummy = lambda: rng.standard_normal((B, *feat)).astype(np.float16)   # noqa: E731
+        b = self._encode_batch(self._to_t({
+            "feat": dummy(), "next_feat": dummy(),
             "proprio": np.zeros((B, a["proprio_dim"]), np.float32), "next_proprio": np.zeros((B, a["proprio_dim"]), np.float32),
             "a_b": np.zeros((B, a["base_dim"]), np.float32), "next_a_b": np.zeros((B, a["base_dim"]), np.float32),
             "a_bar": np.zeros((B, self.act_dim), np.float32), "reward": np.zeros(B, np.float32),
             "done": np.zeros(B, np.float32), "mc_return": np.zeros(B, np.float32),
-        })
+        }))
         closs, _ = self.critic_loss(b, self.xi, calql_alpha=1.0)
         closs.backward()
         aloss, _, _ = self.actor_loss(b, self.xi)
@@ -284,7 +378,7 @@ class ResidualSAC:
         # batches the prefetch threads keep on the device (queue + one in flight per thread)
         nt = int(self.rl.get("prefetch_threads", 0))
         if nt > 0:
-            hold = [torch.empty((2, B, *feat), dtype=torch.float16, device=self.device)
+            hold = [torch.empty((2, B, *feat), dtype=fdt, device=self.device)
                     for _ in range(nt + int(self.rl.get("prefetch_depth", 2)))]
             del hold
 

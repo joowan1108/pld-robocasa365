@@ -1,4 +1,9 @@
-"""LoRA (r=32) SFT of Xiaomi-Robotics-1-RoboCasa365 on PLD data (PLD App. C.2: LoRA rank 32).
+"""LoRA (r=32) SFT of Xiaomi-Robotics-1-RoboCasa365 on PLD data (PLD App. C.2: LoRA rank 32), or full fine-tuning
+(--mode full) as in the XR-1 code base's post-training (xr1/configs, Xiaomi-Robotics-1 @0dd7aef): every weight trains
+except the input embeddings (XR1.py: `get_input_embeddings().requires_grad_(False)`), gradient checkpointing on the
+vision tower and on every LLM MLP (posttrain.yaml ffn_gradient_checkpointing), Adam betas (0.9, 0.95), weight decay
+0.1 except bias / norm / rotary / adaln parameters (base_runner.build_optimizer), fp32 master weights with bf16
+autocast (Lightning "bf16-mixed"). LR schedule: run_sft --xr1-defaults (peak 2e-5).
 
 Written from scratch: the released xr1/ trainer is full fine-tuning, belongs to a different training recipe and is
 shape-incompatible with the RoboCasa365 checkpoint. The loss reproduces the HF inference path of
@@ -132,20 +137,65 @@ def flow_matching_loss(m, b: dict, noise_repeats: int) -> torch.Tensor:
     return (((pred.float() - v.float()) ** 2) * w).sum() / w.sum().clamp_min(1.0)
 
 
+def unwrap(model):
+    """The MiBoTForActionGeneration module: inside a peft wrapper (LoRA) or the model itself (full fine-tuning)."""
+    try:
+        from peft import PeftModel
+    except ImportError:  # pragma: no cover
+        PeftModel = ()
+    return model.base_model.model if isinstance(model, PeftModel) else model
+
+
 class LossModule(torch.nn.Module):
     """Routes the loss through forward() so DDP's reducer sees every step."""
 
-    def __init__(self, peft_model, noise_repeats: int):
+    def __init__(self, model, noise_repeats: int):
         super().__init__()
-        self.peft_model = peft_model
+        self.peft_model = model          # name kept: LoRA runs wrap a peft model, full fine-tuning the plain model
         self.noise_repeats = noise_repeats
 
     def forward(self, batch: dict) -> torch.Tensor:
-        return flow_matching_loss(self.peft_model.base_model.model, batch, self.noise_repeats)
+        return flow_matching_loss(unwrap(self.peft_model), batch, self.noise_repeats)
+
+
+# XR-1 base_runner.build_optimizer: parameters whose (lower-cased) name contains one of these get no weight decay
+XR1_NO_DECAY = ("bias", "norm", "ln", "rotary_emb", "adaln")
+
+
+def setup_full_finetune(m) -> None:
+    """XR-1 post-training: all weights train except the input embeddings; gradient checkpointing on the vision tower
+    and on every LLM MLP (the K/V cache the DiT reads is unaffected: attention is not checkpointed)."""
+    import torch.utils.checkpoint as ckpt
+
+    m.requires_grad_(True)
+    m.vlm.get_input_embeddings().requires_grad_(False)
+    m.vlm.model.visual.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    for layer in m.vlm.model.language_model.layers:
+        mlp = layer.mlp
+        if getattr(mlp, "_pld_ckpt", False):
+            continue
+        orig = mlp.forward
+
+        def fwd(x, forward=orig, module=mlp):
+            if module.training and torch.is_grad_enabled():
+                return ckpt.checkpoint(forward, x, use_reentrant=False)
+            return forward(x)
+
+        mlp.forward = fwd
+        mlp._pld_ckpt = True
+
+
+def full_ft_param_groups(model, weight_decay: float) -> list[dict]:
+    named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    nd = [p for n, p in named if any(k in n.lower() for k in XR1_NO_DECAY)]
+    d = [p for n, p in named if not any(k in n.lower() for k in XR1_NO_DECAY)]
+    return [{"params": d, "weight_decay": weight_decay}, {"params": nd, "weight_decay": 0.0}]
 
 
 def save_merged(model, processor_src: Path, out: Path):
-    merged = model.merge_and_unload()
+    """LoRA: merge the adapters into the base weights; full fine-tuning: the model itself. Saved in bf16 together with
+    the processor / custom-code files, so the inference server loads it like the released checkpoint."""
+    merged = model.merge_and_unload() if hasattr(model, "merge_and_unload") else model
     merged = merged.to(torch.bfloat16)
     merged.save_pretrained(out, safe_serialization=True)
     for f in processor_src.iterdir():  # custom code, tokenizer, processor/preprocessor configs, chat template
@@ -169,6 +219,10 @@ def main():
     ap.add_argument("--warmup-steps", type=int, default=None, help="overrides --warmup-ratio")
     ap.add_argument("--warmup-lr-start", type=float, default=0.0, help="lr at step 0 of the linear warm-up")
     ap.add_argument("--min-lr", type=float, default=0.0, help="cosine floor")
+    ap.add_argument("--mode", default="lora", choices=["lora", "full"],
+                    help="lora: LoRA r=lora_rank + fully trained projectors; full: XR-1 code base full fine-tuning")
+    ap.add_argument("--adam-beta2", type=float, default=None,
+                    help="default: 0.999 for lora (all runs before 2026-11-24), 0.95 for full (XR-1 code base)")
     ap.add_argument("--lora-rank", type=int, default=32)
     ap.add_argument("--lora-alpha", type=int, default=32)
     ap.add_argument("--noise-repeats", type=int, default=4)
@@ -208,13 +262,16 @@ def main():
     assert ROBOT_TYPE in processor.list_robot_types()
     model = AutoModel.from_pretrained(src, trust_remote_code=True, attn_implementation=args.attn,
                                       dtype=torch.bfloat16)
-    model.requires_grad_(False)
-    model = get_peft_model(model, LoraConfig(r=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=0.0,
-                                             target_modules=lora_targets(model.config.vlm_config.text_config.num_hidden_layers),
-                                             bias="none"))
-    inner = model.base_model.model
-    for name in FULLY_TRAINED:
-        getattr(inner, name).requires_grad_(True)
+    if args.mode == "full":
+        setup_full_finetune(model)
+    else:
+        model.requires_grad_(False)
+        model = get_peft_model(model, LoraConfig(r=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=0.0,
+                                                 target_modules=lora_targets(model.config.vlm_config.text_config.num_hidden_layers),
+                                                 bias="none"))
+        inner = model.base_model.model
+        for name in FULLY_TRAINED:
+            getattr(inner, name).requires_grad_(True)
     for p in model.parameters():
         if p.requires_grad:
             p.data = p.data.float()
@@ -231,7 +288,12 @@ def main():
                                      persistent_workers=args.num_workers > 0)
     accum = max(1, args.global_batch_size // (args.per_device_batch_size * world))
     params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    beta2 = args.adam_beta2 if args.adam_beta2 is not None else (0.95 if args.mode == "full" else 0.999)
+    if args.mode == "full":
+        opt = torch.optim.AdamW(full_ft_param_groups(model, args.weight_decay), lr=args.lr, betas=(0.9, beta2),
+                                eps=1e-8, fused=True)
+    else:
+        opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, beta2))
     # linear warm-up warmup_lr_start -> lr, then cosine lr -> min_lr (XR-1's mibot.utils.cosine_warmup schedule)
     warm = int(args.warmup_steps if args.warmup_steps is not None else args.warmup_ratio * args.max_steps)
     lo, hi, w0 = args.min_lr / args.lr, 1.0, args.warmup_lr_start / args.lr
@@ -286,12 +348,15 @@ def main():
                 # loss: mean over the full batch of this step (all micro-batches); loss_avg20: mean of the last 20
                 # optimizer steps. Logs before 2026-11-23 had only the last micro-batch's loss of the step.
                 log.write(json.dumps({"step": step, "loss": window[-1], "loss_avg20": sum(window) / len(window),
-                                      "lr": sched.get_last_lr()[0], "elapsed_s": time.time() - t_start}) + "\n")
+                                      "lr": sched.get_last_lr()[0], "elapsed_s": time.time() - t_start,
+                                      "max_mem_gb": round(torch.cuda.max_memory_allocated(dev) / 2**30, 1)}) + "\n")
                 log.flush()
                 window.clear()
             if args.save_steps and step % args.save_steps == 0 and rank == 0:
-                torch.save({n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad},
-                           out / f"trainable_step{step}.pt")
+                # full fine-tuning: bf16 copies (4.4B weights: 8.8 GB instead of 17.6 GB per kept checkpoint)
+                dt = torch.bfloat16 if args.mode == "full" else None
+                torch.save({n: (p.detach().to(dt) if dt else p.detach()).cpu() for n, p in model.named_parameters()
+                            if p.requires_grad}, out / f"trainable_step{step}.pt")
             stop_now = es["stopped"] is not None
             if ddp:   # every rank stops at the same step
                 flag = torch.tensor([1.0 if stop_now else 0.0], device=dev)
@@ -322,7 +387,9 @@ def main():
                   "save_steps": args.save_steps, "lr": args.lr, "min_lr": args.min_lr, "warmup_steps": warm, "warmup_lr_start": args.warmup_lr_start,
                   "weight_decay": args.weight_decay, "train_loop_seconds": train_s, "total_seconds": time.time() - t_start, "steps": step,
                   "world_size": world, "global_batch_size": args.per_device_batch_size * world * accum,
-                  "num_samples": len(ds), "data": args.data, "trainable_params": n_train, "lora_rank": args.lora_rank}
+                  "num_samples": len(ds), "data": args.data, "trainable_params": n_train, "mode": args.mode,
+                  "lora_rank": args.lora_rank if args.mode == "lora" else None, "adam_betas": [0.9, beta2],
+                  "peak_gpu_mem_gb": torch.cuda.max_memory_allocated(dev) / 2**30}
         (out / "sft_timing.json").write_text(json.dumps(timing, indent=2))
     if ddp:
         dist.destroy_process_group()

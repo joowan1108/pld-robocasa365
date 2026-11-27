@@ -458,7 +458,7 @@ def test_offline_cache_key_depends_on_what_the_buffers_store():
     spec = SimpleNamespace(layout_id=11, style_id=34)
     cfg = {"paths": {"runs_root": "runs"}, "model_name": "xr1", "task_name": "T", "base": {"exec_steps": 16},
            "stage1": {"init_seed_pool": 0}, "seeds": {"offline": 0},
-           "residual": {"image_size": 128, "cameras": ["a", "b"]}}
+           "residual": {"image_size": 128, "cameras": ["a", "b"]}, "env": {}}
     assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16"          # the pre-2026-11-21 buffers
     cfg["residual"]["image_size"] = 256
     assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16_i256"
@@ -468,6 +468,9 @@ def test_offline_cache_key_depends_on_what_the_buffers_store():
     assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16_i256_c3_v4p4"
     cfg["residual"]["augment"] = {"views": 0, "pad": 4}
     assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16_i256_c3"
+    cfg["residual"]["augment"] = {"mode": "online", "views": 4, "pad": 4}   # raw images: views / pad not stored
+    assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16_i256_c3_img"
+    cfg["residual"]["augment"] = {"views": 0, "pad": 4}
     cfg["rl"] = {"residual_hold": 8, "n_step": 3}
     assert offline_cache_dir(cfg, spec, 50).name == "L11_S34_n50_e16_i256_c3_h8n3"
 
@@ -814,3 +817,203 @@ def test_base_policy_client_applies_action_bias():
     assert np.array_equal(b.peek(0), np.arange(12))
     b.action_bias = np.zeros(12, np.float32); b.action_bias[0] = 0.05
     assert b.peek(0)[0] == np.float32(0.05) and b.pop(0)[0] == np.float32(0.05)
+
+
+def test_residual_proprio_selection(tmp_path):
+    """residual.proprio: the networks see only the named proprio components; buffers keep all 16 entries, and
+    loading a checkpoint takes the selection from the checkpoint whatever the run config says."""
+    from pld_rc365.common import load_specialists, save_specialists, build_specialists
+    from pld_rc365.rl.agent import proprio_indices, proprio_names
+    assert proprio_indices(None) is None
+    assert proprio_indices(["end_effector_position_relative"]) == (7, 8, 9)
+    assert proprio_indices(["gripper_qpos", "end_effector_position_relative"]) == (7, 8, 9, 14, 15)
+    assert proprio_names((7, 8, 9)) == ("end_effector_position_relative",)
+    with pytest.raises(ValueError):
+        proprio_indices(["base"])
+    rl = {**RL, "critic_action": "residual", "device": "cpu"}
+    res = {**RES, "xi": 0.1, "xi_scale": [1, 1, 1, 0, 0, 0, 0], "proprio": ["end_effector_position_relative"]}
+    ag = ResidualSAC(rl, res, FMAP, 2, device="cpu", seed=0)
+    for enc in (ag.actor.encoder, ag.critic.encoder):
+        assert enc.proprio[0].in_features == 3
+    rng = np.random.default_rng(0)
+    B = 8
+    f = rng.standard_normal((B, 2, *FMAP)).astype(np.float32)
+    p = rng.standard_normal((B, 16)).astype(np.float32)
+    ab = rng.uniform(-.5, .5, (B, 12)).astype(np.float32)
+    p2 = p.copy()
+    p2[:, [0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15]] += 5.0       # every entry but the eef position
+    a1 = ag.act(ag.actor, f, p, ab, deterministic=True)
+    assert np.array_equal(a1, ag.act(ag.actor, f, p2, ab, deterministic=True))
+    p3 = p.copy()
+    p3[:, 8] += 1.0                                                  # eef y
+    assert not np.allclose(a1, ag.act(ag.actor, f, p3, ab, deterministic=True))
+    # an update runs on 16-D stored proprio
+    b = {"feat": f, "next_feat": f, "proprio": p, "next_proprio": p2, "a_b": ab, "next_a_b": ab,
+         "a_bar": np.clip(ab[:, :7], -1, 1), "reward": np.zeros(B, np.float32), "done": np.zeros(B, np.float32),
+         "mc_return": np.zeros(B, np.float32)}
+    info = ag.update(b)
+    assert all(np.isfinite(v) for v in info.values() if isinstance(v, float))
+    # default (null) keeps all 16
+    assert ResidualSAC(rl, RES, FMAP, 2, device="cpu").actor.encoder.proprio[0].in_features == 16
+    # checkpoint round trip: a run config without residual.proprio still loads a 3-D checkpoint
+    cfg = {"rl": rl, "residual": {**res, "augment": {"views": 0}}, "env": {}}
+    specs = build_specialists(cfg, FMAP, 2, [0], online_capacity=1, offline_capacity=1)
+    save_specialists(specs, tmp_path / "s.pt")
+    cfg_plain = {"rl": rl, "residual": {k: v for k, v in cfg["residual"].items() if k != "proprio"}}
+    loaded = load_specialists(cfg_plain, tmp_path / "s.pt", FMAP, 2)
+    la = loaded[0].agent
+    assert la.actor.encoder.proprio[0].in_features == 3
+    assert np.array_equal(la.act(la.actor, f, p, ab, True), specs[0].agent.act(specs[0].agent.actor, f, p, ab, True))
+
+
+def test_warmup_key_ignores_default_proprio():
+    from pld_rc365.stage1_train import warmup_meta
+    cfg = {"rl": {"discount": 0.99}, "residual": {"dims": 7, "xi": 0.1}, "seeds": {"warmup": 200000, "offline": 100000},
+           "stage1": {}, "env": {}, "task": {"stages": ["main"]}}
+    m0 = warmup_meta(cfg, {})
+    m1 = warmup_meta({**cfg, "residual": {**cfg["residual"], "proprio": None}}, {})
+    m2 = warmup_meta({**cfg, "residual": {**cfg["residual"], "proprio": ["end_effector_position_relative"]}}, {})
+    assert m0 == m1 and m0 != m2
+
+
+# ---------------------------------------------------------------- learner-side augmentation (augment.mode online)
+class _CountingBackbone(torch.nn.Module):
+    """Records every batch it encodes; features = per-camera mean pixel (like FakeBackbone)."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = []
+
+    def forward(self, x, chunk=None):
+        self.seen.append(x.clone())
+        m = x.float().mean(dim=(2, 3, 4))
+        return m[..., None, None, None].expand(*m.shape, 4, 2, 2).half()
+
+
+def _image_batch(B, rng, img=(2, 6, 6, 3)):
+    return {"feat": rng.integers(0, 256, (B, *img), dtype=np.uint8), "next_feat": rng.integers(0, 256, (B, *img), dtype=np.uint8),
+            "proprio": np.zeros((B, 16), np.float32), "next_proprio": np.zeros((B, 16), np.float32),
+            "a_b": np.zeros((B, 12), np.float32), "next_a_b": np.zeros((B, 12), np.float32),
+            "a_bar": np.zeros((B, 7), np.float32), "reward": np.zeros(B, np.float32), "done": np.zeros(B, np.float32),
+            "mc_return": np.zeros(B, np.float32), "steps": np.ones(B, np.float32)}
+
+
+def test_image_buffer_stores_raw_images_and_samples_uint8():
+    from pld_rc365.rl.buffers import FrameRef
+    buf = ReplayBuffer(50, (2, 6, 6, 3), 16, 12, 7, images=True)
+    assert buf.frames.dtype == np.uint8 and buf.frames.shape == (buf.frame_capacity, 1, 2, 6, 6, 3)
+    rng = np.random.default_rng(0)
+    ims = [rng.integers(0, 256, (2, 6, 6, 3), dtype=np.uint8) for _ in range(4)]
+    frs = [FrameRef(np.zeros((1, 2, 4, 2, 2), np.float16), images=im) for im in ims]
+    for t in range(3):
+        buf.add({"feat": frs[t], "next_feat": frs[t + 1], "proprio": np.zeros(16), "a_b": np.zeros(12), "a_bar": np.zeros(7),
+                 "reward": 0.0, "done": 0.0, "next_proprio": np.zeros(16), "next_a_b": np.zeros(12)})
+    assert buf.frames_added == 4                                         # shared frames stored once
+    for t in range(4):
+        assert np.array_equal(buf.frames[t, 0], ims[t])
+    b = buf.sample(16, rng)
+    assert b["feat"].dtype == np.uint8 and b["feat"].shape == (16, 2, 6, 6, 3)
+    spec = buf.batch_spec()
+    assert spec["feat"] == ((2, 6, 6, 3), torch.uint8)
+    with pytest.raises(ValueError):                                      # a feature-only frame cannot go in
+        buf.add({"feat": FrameRef(np.zeros((1, 2, 4, 2, 2), np.float16)), "next_feat": frs[0], "proprio": np.zeros(16),
+                 "a_b": np.zeros(12), "a_bar": np.zeros(7), "reward": 0.0, "done": 0.0, "next_proprio": np.zeros(16),
+                 "next_a_b": np.zeros(12)})
+
+
+def test_learner_shifts_and_encodes_every_batch_anew():
+    """mode online: each update encodes fresh random shifts of the stored images (s and s' independently), so the
+    same transition gives different features in different updates; the shifts stay within +-pad."""
+    rl = {**RL, "critic_action": "residual", "encoder_dropout": 0.1}
+    ag = ResidualSAC(rl, RES, FMAP, 2, device="cpu", seed=0)
+    bb = _CountingBackbone()
+    ag.set_image_encoder(bb, (2, 6, 6, 3), pad=2, chunk=4)
+    b = _image_batch(8, np.random.default_rng(0))
+    b["next_feat"] = b["feat"].copy()                                    # s' = s: shifts must still differ
+    for _ in range(3):
+        assert np.isfinite(ag.update(b)["critic_loss"])
+    assert len(bb.seen) == 3 and all(x.shape == (16, 2, 6, 6, 3) for x in bb.seen)   # s and s' in one pass
+    assert not torch.equal(bb.seen[0], bb.seen[1])                       # fresh shifts per update
+    assert not torch.equal(bb.seen[0][:8], bb.seen[0][8:])               # s and s' shifted independently
+    raw = torch.as_tensor(b["feat"])
+    for x in bb.seen:                                                    # every image is a +-2 px replicate crop
+        for i in range(8):
+            for c in range(2):
+                pad = torch.nn.functional.pad(raw[i, c].permute(2, 0, 1)[None].float(), (2, 2, 2, 2), mode="replicate")[0].permute(1, 2, 0)
+                assert any(torch.equal(pad[dy:dy + 6, dx:dx + 6].to(torch.uint8), x[i, c]) for dy in range(5) for dx in range(5))
+    with pytest.raises(RuntimeError):                                    # image batch without an encoder
+        ResidualSAC(RL, RES, FMAP, 2, device="cpu").update(b)
+
+
+def test_encoder_dropout_only_while_learning():
+    """rl.encoder_dropout: active in the learner's actor/critic (train mode), off in the collector copy and the
+    target critic (eval), so acting with the mean is deterministic."""
+    import copy
+    rl = {**RL, "encoder_dropout": 0.5}
+    ag = ResidualSAC(rl, RES, FMAP, 2, device="cpu", seed=0)
+    assert ag.actor.encoder.heads[0].drop.p == 0.5 and not ag.critic_targ.training and ag.critic.training
+    f, p, ab = torch.randn(4, 2, *FMAP), torch.randn(4, 16), torch.randn(4, 12)
+    a1, _ = ag.actor(f, p, ab, 0.5, deterministic=True)
+    a2, _ = ag.actor(f, p, ab, 0.5, deterministic=True)
+    assert not torch.equal(a1, a2)                                       # train mode: dropout
+    col = copy.deepcopy(ag.actor).requires_grad_(False).eval()
+    assert torch.equal(col(f, p, ab, 0.5, deterministic=True)[0], col(f, p, ab, 0.5, deterministic=True)[0])
+    q1 = ag.critic_targ(f, p, ab, torch.zeros(4, 7))
+    assert torch.equal(q1, ag.critic_targ(f, p, ab, torch.zeros(4, 7)))
+    assert ResidualSAC(RL, RES, FMAP, 2, device="cpu").actor.encoder.heads[0].drop.p == 0.0   # default: off
+
+
+def test_runner_stores_raw_images_and_acts_on_plain_features():
+    """Runner.store_images: buffers get the raw residual images of every stored frame, the actor still gets the
+    plain frame's features, and s' of a transition is the same stored frame as s of the next."""
+    runner, venv, base, specs = make_runner(num_envs=1, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    specs[0].online = ReplayBuffer(500, (2, 4, 4, 3), 16, 12, 7, images=True)
+    runner.store_images = True
+    seen = []
+    real_act = specs[0].agent.act
+    specs[0].agent.act = lambda actor, feats, *a, **k: (seen.append(np.asarray(feats).copy()), real_act(actor, feats, *a, **k))[1]
+    run_n(runner, [EpisodeSpec(seed=1, mode="pld", t_base=0, store="online")], 1)
+    buf = specs[0].online
+    assert buf.size == 12 and buf.frames_added == 13
+    assert np.array_equal(buf.data["next_obs_id"][:11], buf.data["obs_id"][1:12])
+    # FakeVecEnv residual images are filled with t: stored frame of s_t is the raw image of step t
+    np.testing.assert_array_equal(buf.frames[buf.data["obs_id"][:12], 0, 0, 0, 0, 0], np.arange(12))
+    assert len(seen) == 12 and all(f.shape == (1, 2, *FMAP) for f in seen)
+    np.testing.assert_allclose([f[0, 0, 0, 0, 0] for f in seen], np.arange(12), atol=1e-2)   # plain-frame features
+
+
+def test_build_specialists_online_augment_wires_image_buffers():
+    from pld_rc365.common import aug_online, aug_views, build_specialists
+    rl = {**RL, "device": "cpu", "encoder_dropout": 0.1}
+    res = {**RES, "image_size": 6, "augment": {"mode": "online", "pad": 3, "views": 4, "encode_chunk": 2}}
+    cfg = {"rl": rl, "residual": res, "env": {}}
+    assert aug_online(cfg) and aug_views(cfg) == 0                       # nothing pre-shifted in mode online
+    bb = _CountingBackbone()
+    sp = build_specialists(cfg, FMAP, 2, [0], online_capacity=20, offline_capacity=20, backbone=bb)[0]
+    assert sp.online.images and sp.offline.images and sp.online.feat_shape == (2, 6, 6, 3)
+    assert sp.agent.image_backbone is bb and sp.agent.aug_pad == 3 and sp.agent.enc_chunk == 2
+    assert not sp.collector_actor.training
+    old = {"rl": rl, "residual": {**RES, "image_size": 6, "augment": {"views": 4, "pad": 4}}, "env": {}}
+    assert not aug_online(old) and aug_views(old) == 4                   # configs without a mode: stored views
+    sp = build_specialists(old, FMAP, 2, [0], online_capacity=20, offline_capacity=20)[0]
+    assert not sp.online.images and sp.online.views == 4 and sp.agent.image_backbone is None
+
+
+def test_non_finite_vla_action_drops_the_episode():
+    """A NaN in the VLA's action (XR1, br2 2026-11-27) drops that episode (nothing executed, counted in the stats)
+    and the env moves on to the next spec, instead of crashing the run."""
+    runner, venv, base, specs = make_runner(num_envs=1, horizon=12, stage_steps=(100,), succeed=lambda s: False)
+    real_ensure = base.ensure
+
+    def ensure(idxs):
+        real_ensure(idxs)
+        for i in idxs:
+            if venv.seed[i] == 7 and venv.t[i] >= 4:
+                for a in base.q[i]:
+                    a[:] = np.nan
+    base.ensure = ensure
+    res = []
+    it = iter([EpisodeSpec(seed=7, mode="base", store="online"), EpisodeSpec(seed=8, mode="base", store="online")])
+    runner.run(lambda: next(it, None), lambda r: res.append(r) or False)
+    assert [r.spec.seed for r in res] == [8] and runner.stats["nan_base_episodes"] == 1
+    assert all(np.isfinite(a).all() for a in venv.actions[(0, 7)]) and len(venv.actions[(0, 7)]) == 4
